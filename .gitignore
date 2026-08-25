@@ -1,0 +1,46 @@
+# --- key material -------------------------------------------------------
+# Per CLAUDE.md 3.10.6 the real key file must NOT be named .env or
+# PRIVATE_KEY or sit at the default keypair path. These patterns are the
+# defensive floor, not the naming convention.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*keypair*.json
+id.json
+secrets/
+keys/
+wallets/
+
+# --- python -------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# --- data / journal -----------------------------------------------------
+# The Postgres journal is the product; dumps and captures stay local.
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.sql.gz
+data/
+captures/
+logs/
+*.log
+
+# --- tooling ------------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+node_modules/
