@@ -12,6 +12,10 @@ id.json
 secrets/
 keys/
 wallets/
+# The filename README.md recommends for local config (see 3.10.6). It holds the
+# provider endpoint and token, so it must never be committable.
+trenches.local.conf
+*.local.conf
 
 # --- python -------------------------------------------------------------
 __pycache__/

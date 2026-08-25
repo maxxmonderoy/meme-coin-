@@ -1,0 +1,19 @@
+# Local Postgres for development. This is NOT the soak host -- CLAUDE.md
+# 3.10.7 wants the bot host separate from the dev machine, and Part 4 wants
+# seven days unattended, which a laptop does not provide.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: trenches
+      POSTGRES_PASSWORD: trenches
+      POSTGRES_DB: trenches
+    ports: ["127.0.0.1:5432:5432"]   # loopback only, never 0.0.0.0
+    volumes: ["trenches_pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trenches -d trenches"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  trenches_pgdata:
