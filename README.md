@@ -20,6 +20,7 @@ evidence which could ever justify paying for a faster feed later.
 ```bash
 uv venv .venv
 uv pip install --python .venv/bin/python --require-hashes --only-binary :all: -r requirements.txt
+uv pip install --python .venv/bin/python -e . --no-deps   # provides the `trenches` command
 
 cp .env.example trenches.local.conf        # NOT `.env` — see §3.10.6
 export TRENCHES_ENV_FILE=trenches.local.conf
@@ -89,6 +90,29 @@ Dependencies hash-pinned, installed `--require-hashes --only-binary :all:`
 age** — the Python analogue of §3.10.3, and the one control in the incident
 record that never failed. No Node, no npm, no install scripts. `.env` and
 `*.local.conf` are gitignored.
+
+## Endpoint paths that are NOT independently verified
+
+Every feed and vendor host was unreachable from the environment this was built
+in, so the following URLs come from CLAUDE.md or from general knowledge rather
+than from a live response. They are the most likely thing to be wrong on a
+first run, and each is a one-line change:
+
+| Where | Path | Sourced from |
+|---|---|---|
+| `stream/pumpportal.py` | `wss://pumpportal.fun/api/data` + `subscribeNewToken` | **verified** — PumpPortal's own repo |
+| `stream/pumpportal.py` | response field names | third-hand write-ups only |
+| `stream/rugcheck_feed.py` | `/v1/stats/new_tokens` | CLAUDE.md §3.2 |
+| `stream/rugcheck_feed.py` | entry shape and timestamp key | guessed; several variants tried |
+| `enrich/rugcheck.py` | `/v1/tokens/{mint}/report` | CLAUDE.md §2 |
+| `enrich/goplus.py` | `https://api.gopluslabs.io/api/v1/solana/token_security` | **general knowledge, not sourced** |
+
+The GoPlus one is the weakest: it was written from recall, not from a document.
+Treat it as a placeholder until a real response confirms it.
+
+Note the install above must be **editable** (`-e .`). Migrations are read from
+the repo's `migrations/` directory relative to the source tree, so a regular
+install would not find them.
 
 ## Not done yet
 
