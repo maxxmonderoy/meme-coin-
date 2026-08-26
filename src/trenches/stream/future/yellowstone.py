@@ -1,4 +1,9 @@
-"""Yellowstone gRPC consumer.
+"""Yellowstone gRPC consumer -- NOT on the week-1 path.
+
+This costs money and 3.2 says do not buy until an upgrade trigger fires. Left
+here complete because the request shape is verified against the real
+geyser.proto and re-deriving it later would be waste.
+
 
 Filter design follows CLAUDE.md 3.3. Two subscriptions are declared as
 separately-named transaction filters inside one request so that every update
@@ -25,11 +30,11 @@ from collections.abc import AsyncIterator
 import base58
 import grpc
 
-from ..decode import idl
-from ..decode.pumpfun import CREATE_EVENT, DecodeError, parse_create_events
-from ..pb import geyser_pb2 as pb
-from ..pb import geyser_pb2_grpc as pb_grpc
-from .base import Consumer, EventKind, RawEvent
+from ...decode import idl
+from ...decode.pumpfun import CREATE_EVENT, DecodeError, parse_create_events
+from ...pb import geyser_pb2 as pb
+from ...pb import geyser_pb2_grpc as pb_grpc
+from ..base import Consumer, EventKind, RawEvent
 
 #: 3.8.3 -- the default 4MB client limit is below real account and block
 #: updates. The symptom of leaving it is a decode error that looks like data

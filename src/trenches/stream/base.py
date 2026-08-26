@@ -1,8 +1,14 @@
 """Transport-neutral event shape and the Consumer contract.
 
-Everything downstream of here is transport-agnostic. That is the point: the
-week-1 soak can run on a replay feed, and swapping in gRPC later must not
-touch the pipeline, the journal, or the dedupe invariant.
+Identity note. Week 1 races two independent free feeds (3.3), and they do not
+agree on identifiers: PumpPortal reports a signature, RugCheck's new_tokens
+listing does not. So there are two identities and they do different jobs:
+
+  * `mint` is the CANDIDATE identity. Dedupe across feeds is on mint, because
+    it is the only thing both feeds agree on for the same launch.
+  * `(provider, event_id)` is the STORAGE identity for raw_events, so the same
+    launch seen by both feeds is stored twice on purpose -- that is what makes
+    the feed race measurable.
 """
 from __future__ import annotations
 
@@ -15,16 +21,13 @@ from typing import Final
 
 class EventKind:
     CREATE: Final = "create"
-    TRADE: Final = "trade"
     MIGRATE: Final = "migrate"
+    TRADE: Final = "trade"
     OTHER: Final = "other"
-    SLOT: Final = "slot"      # never journalled; drives the watchdog and gap detection
-    PING: Final = "ping"      # never journalled; liveness only
+    PING: Final = "ping"      # liveness only, never journalled
 
 
-#: Kinds that are bookkeeping rather than observations. Never written to
-#: raw_events regardless of retention mode.
-EPHEMERAL_KINDS: Final = frozenset({EventKind.SLOT, EventKind.PING})
+EPHEMERAL_KINDS: Final = frozenset({EventKind.PING})
 
 
 def _now() -> dt.datetime:
@@ -33,57 +36,63 @@ def _now() -> dt.datetime:
 
 @dataclass(frozen=True, slots=True)
 class RawEvent:
-    """One observation from a feed.
-
-    `commitment` is carried on every event because CLAUDE.md 3.8.7 forbids
-    treating `processed` as authoritative -- the reconcile tier has to be
-    visible at the point of storage, not inferred later.
-    """
-
-    signature: str
-    slot: int
     provider: str
     event_kind: str
+    mint: str | None = None
+    signature: str | None = None
+    slot: int | None = None
     commitment: str = "processed"
-    program_id: str | None = None
     block_time: dt.datetime | None = None
-    filter_source: str | None = None
     payload: dict | None = None
     received_at: dt.datetime = field(default_factory=_now)
 
     @property
-    def dedupe_key(self) -> tuple[str, int]:
-        """The 3.8.4 identity. Duplicates are guaranteed on replay/reconnect."""
-        return (self.signature, self.slot)
+    def event_id(self) -> str:
+        """Storage identity within a feed.
+
+        Prefers the signature where the feed provides one, since a single mint
+        can legitimately produce more than one event from the same feed.
+        """
+        return self.signature or self.mint or ""
 
     @property
     def is_ephemeral(self) -> bool:
         return self.event_kind in EPHEMERAL_KINDS
+
+    @property
+    def is_candidate(self) -> bool:
+        """A launch worth putting on the desk."""
+        return self.event_kind in (EventKind.CREATE, EventKind.MIGRATE) and bool(self.mint)
 
 
 class Consumer(abc.ABC):
     """A feed that yields RawEvents until it fails or is cancelled.
 
     Implementations must not retry internally. Reconnection, backoff and
-    liveness are the supervisor's job, so that every transport gets identical
-    stall detection rather than three subtly different versions of it.
+    liveness belong to the supervisor so every transport gets identical stall
+    detection rather than three subtly different versions of it.
     """
 
     provider: str
 
-    #: True when the source is exhaustible (a capture file) rather than a live
-    #: feed. A live feed's clean EOF means the server closed the connection and
-    #: the supervisor must reconnect; a finite source's EOF means the work is
-    #: done and reconnecting would replay it forever.
+    #: True when the source is exhaustible (a capture file). A live feed's clean
+    #: EOF means the server hung up and the supervisor must reconnect; a finite
+    #: source's EOF means the work is done and reconnecting replays it forever.
     finite: bool = False
+
+    #: Seconds of total silence after which the supervisor declares the feed
+    #: dead and restarts it, regardless of what the socket claims.
+    #:
+    #: 3.8.1's 3-second rule is specifically a slot-monotonicity watchdog on a
+    #: gRPC stream, and there are no slots on a websocket. Launch events arrive
+    #: irregularly -- roughly 42k/day is one every couple of seconds on average
+    #: but bursty -- so a 3s threshold on event arrival would restart a healthy
+    #: feed constantly. Each consumer sets its own honest threshold.
+    idle_timeout_seconds: float = 120.0
 
     @abc.abstractmethod
     def subscription_descriptor(self) -> dict:
-        """Exact subscription being requested, stored verbatim in `streams`.
-
-        This is what makes the 3.3 strict-vs-naive filter diff reproducible
-        after the fact instead of a thing you remember doing.
-        """
+        """Exact subscription requested, stored verbatim in `streams`."""
 
     @abc.abstractmethod
     def stream(self) -> AsyncIterator[RawEvent]:

@@ -1,11 +1,8 @@
-"""Replay consumer: reads recorded frames from disk.
+"""Replay consumer: reads recorded events from disk.
 
-The only feed that runs with no subscription and no credentials, which makes it
-the one the pipeline, dedupe and journal are actually exercised against before
-any money is spent on a provider.
-
-It is also how duplicates get tested honestly. Reconnect and replay guarantee
-duplicates (3.8.4); replaying the same capture twice reproduces that exactly.
+Runs with no network and no credentials, which makes it the feed the pipeline,
+dedupe and journal are actually exercised against. Replaying the same capture
+twice reproduces the duplicate guarantee from 3.8.4 exactly.
 """
 from __future__ import annotations
 
@@ -23,28 +20,17 @@ log = get(__name__)
 
 class ReplayConsumer(Consumer):
     provider = "replay"
+    idle_timeout_seconds = 1e9  # a file cannot stall
 
-    def __init__(
-        self,
-        path: Path,
-        *,
-        speed: float = 0.0,
-        loop: bool = False,
-    ) -> None:
-        """`speed` 0 replays as fast as possible; >0 sleeps that many seconds
-        between events, which is how the slot watchdog gets exercised."""
+    def __init__(self, path: Path, *, speed: float = 0.0, loop: bool = False) -> None:
         self._path = Path(path)
         self._speed = speed
         self._loop = loop
         self.finite = not loop
 
     def subscription_descriptor(self) -> dict:
-        return {
-            "provider": self.provider,
-            "path": str(self._path),
-            "speed": self._speed,
-            "loop": self._loop,
-        }
+        return {"provider": self.provider, "path": str(self._path),
+                "speed": self._speed, "loop": self._loop}
 
     def _files(self) -> list[Path]:
         if self._path.is_file():
@@ -62,8 +48,8 @@ class ReplayConsumer(Consumer):
             )
         while True:
             for file in files:
-                for line_no, line in enumerate(file.read_text().splitlines(), start=1):
-                    line = line.strip()
+                for line_no, raw_line in enumerate(file.read_text().splitlines(), start=1):
+                    line = raw_line.strip()
                     if not line:
                         continue
                     try:
@@ -82,20 +68,25 @@ class ReplayConsumer(Consumer):
 
     @staticmethod
     def _to_event(record: dict) -> RawEvent | None:
-        """Capture rows are RawEvent dicts as written by the recorder."""
-        if "signature" not in record and "frame" in record:
-            # A raw provider frame rather than a normalised event: replaying it
-            # would require the provider's mapping, which is the caller's job.
+        # A raw provider frame rather than a normalised event: mapping it needs
+        # that provider's schema, which is the provider consumer's job.
+        if "frame" in record and "provider" not in record:
             return None
         block_time = record.get("block_time")
+        # Preserve the RECORDED arrival time. Stamping "now" instead collapses
+        # every inter-feed gap to zero, which silently destroys the one
+        # measurement (3.2 upgrade trigger 2) that replay exists to let us
+        # re-run offline.
+        received_at = record.get("received_at")
         return RawEvent(
-            signature=record["signature"],
-            slot=int(record["slot"]),
             provider=record.get("provider", "replay"),
             event_kind=record.get("event_kind", EventKind.OTHER),
+            mint=record.get("mint"),
+            signature=record.get("signature"),
+            slot=record.get("slot"),
             commitment=record.get("commitment", "processed"),
-            program_id=record.get("program_id"),
             block_time=dt.datetime.fromisoformat(block_time) if block_time else None,
-            filter_source=record.get("filter_source"),
             payload=record.get("payload"),
+            **({"received_at": dt.datetime.fromisoformat(received_at)}
+               if received_at else {}),
         )

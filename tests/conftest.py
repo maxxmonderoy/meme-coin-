@@ -13,12 +13,10 @@ import base58
 
 from trenches.decode import idl
 
-#: Override with TRENCHES_TEST_DSN. Tests that need a database SKIP rather
-#: than fail when none is reachable -- but a skipped schema test proves
-#: nothing, so check the summary for `s` before trusting a green run.
-TEST_DSN = os.environ.get(
-    "TRENCHES_TEST_DSN", "postgresql://trenches@127.0.0.1:5433/trenches"
-)
+#: Postgres is optional. SQLite is the default store (3.2), so the portable
+#: tests run everywhere and the Postgres pass only runs when a DSN is given.
+#: A skipped dialect test proves nothing -- check for `s` in the summary.
+POSTGRES_DSN = os.environ.get("TRENCHES_TEST_POSTGRES_DSN")
 
 
 def pubkey(seed: int) -> str:
@@ -28,8 +26,8 @@ def pubkey(seed: int) -> str:
 def encode_create_event(**overrides) -> bytes:
     """Borsh-encode a CreateEvent using the layout from the vendored IDL.
 
-    The layout is read from the IDL rather than restated here, so this fixture
-    cannot drift away from the decoder it is testing while still passing.
+    The layout is read from the IDL rather than restated, so this fixture cannot
+    drift away from the decoder it tests while still passing.
     """
     values = {
         "name": "Test Coin", "symbol": "TEST", "uri": "https://example/meta.json",
@@ -44,7 +42,6 @@ def encode_create_event(**overrides) -> bytes:
         "virtual_quote_reserves": 0,
     }
     values.update(overrides)
-
     out = b""
     for field in idl.event_fields("pump", "CreateEvent"):
         ty, value = field["type"], values[field["name"]]
@@ -59,7 +56,7 @@ def encode_create_event(**overrides) -> bytes:
             out += struct.pack("<q", value)
         elif ty == "bool":
             out += bytes([1 if value else 0])
-        else:  # pragma: no cover - guards against a new IDL primitive
+        else:  # pragma: no cover
             raise AssertionError(f"fixture cannot encode IDL type {ty!r}")
     return idl.event_discriminators("pump")["CreateEvent"] + out
 
@@ -76,3 +73,43 @@ def create_logs():
         create_log_line(**kw),
         "Program log: Program consumed 12345 compute units",
     ]
+
+
+@pytest.fixture
+async def sqlite_db(tmp_path):
+    from trenches.db import migrate as migrate_mod
+    from trenches.db import pool as pool_mod
+
+    db = await pool_mod.connect(f"sqlite://{tmp_path}/test.db")
+    await migrate_mod.migrate(db)
+    try:
+        yield db
+    finally:
+        await db.close()
+
+
+@pytest.fixture(params=["sqlite", "postgres"])
+async def any_db(request, tmp_path):
+    """Runs each portability test on both engines.
+
+    This is what makes 3.2's "the swap is a connection-string change" a tested
+    claim rather than an intention.
+    """
+    from trenches.db import migrate as migrate_mod
+    from trenches.db import pool as pool_mod
+
+    if request.param == "postgres":
+        if not POSTGRES_DSN:
+            pytest.skip("set TRENCHES_TEST_POSTGRES_DSN to run the Postgres pass")
+        db = await pool_mod.connect(POSTGRES_DSN)
+        for table in ("decisions", "enrich_cache", "feed_health", "feed_latency",
+                      "raw_events", "tokens_seen", "creators", "streams",
+                      "schema_migrations"):
+            await db.execute(f"drop table if exists {table} cascade")
+    else:
+        db = await pool_mod.connect(f"sqlite://{tmp_path}/test.db")
+    await migrate_mod.migrate(db)
+    try:
+        yield db
+    finally:
+        await db.close()

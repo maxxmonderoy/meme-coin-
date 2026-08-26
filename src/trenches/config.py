@@ -10,7 +10,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-VALID_FEEDS = ("yellowstone", "pumpportal", "replay")
+VALID_FEEDS = ("pumpportal", "rugcheck", "replay")
 VALID_FILTER_MODES = ("strict", "naive", "both")
 VALID_RETENTION = ("creates_full", "all", "creates_only")
 
@@ -64,14 +64,16 @@ def _get_float(name: str, default: float) -> float:
 @dataclass(frozen=True, slots=True)
 class Config:
     dsn: str
+    feeds: tuple[str, ...]
     feed: str
     filter_mode: str
     retention: str
     replay_path: Path
-    yellowstone_endpoint: str
-    yellowstone_token: str
-    yellowstone_tls: bool
     pumpportal_url: str
+    pumpportal_strict: bool
+    rugcheck_base: str
+    rugcheck_interval_seconds: float
+    rugcheck_startup_max_age_seconds: float
     queue_maxsize: int
     workers: int
     dedupe_ttl_seconds: int
@@ -87,9 +89,17 @@ class Config:
     @staticmethod
     def from_env() -> Config:
         _load_env_file()
-        feed = _get("TRENCHES_FEED", "replay").lower()
-        if feed not in VALID_FEEDS:
-            raise ConfigError(f"TRENCHES_FEED must be one of {VALID_FEEDS}, got {feed!r}")
+        feeds = tuple(
+            f.strip().lower()
+            for f in _get("TRENCHES_FEEDS", "pumpportal,rugcheck").split(",")
+            if f.strip()
+        )
+        if not feeds:
+            raise ConfigError("TRENCHES_FEEDS is empty; name at least one feed")
+        for f in feeds:
+            if f not in VALID_FEEDS:
+                raise ConfigError(f"unknown feed {f!r}; valid feeds are {VALID_FEEDS}")
+        feed = feeds[0]
 
         filter_mode = _get("TRENCHES_FILTER_MODE", "both").lower()
         if filter_mode not in VALID_FILTER_MODES:
@@ -103,27 +113,19 @@ class Config:
                 f"TRENCHES_RETENTION must be one of {VALID_RETENTION}, got {retention!r}"
             )
 
-        endpoint = os.environ.get("TRENCHES_YELLOWSTONE_ENDPOINT", "").strip()
-        if feed == "yellowstone" and not endpoint:
-            raise ConfigError(
-                "TRENCHES_FEED=yellowstone but TRENCHES_YELLOWSTONE_ENDPOINT is empty. "
-                "Set it, or use TRENCHES_FEED=replay which needs no subscription."
-            )
-        if "://" in endpoint:
-            raise ConfigError(
-                f"TRENCHES_YELLOWSTONE_ENDPOINT must be host:port with no scheme, got {endpoint!r}"
-            )
-
         cfg = Config(
-            dsn=_get("TRENCHES_DSN"),
+            dsn=_get("TRENCHES_DSN", "sqlite://./trenches.db"),
+            feeds=feeds,
             feed=feed,
             filter_mode=filter_mode,
             retention=retention,
             replay_path=Path(_get("TRENCHES_REPLAY_PATH", "./captures")),
-            yellowstone_endpoint=endpoint,
-            yellowstone_token=os.environ.get("TRENCHES_YELLOWSTONE_TOKEN", "").strip(),
-            yellowstone_tls=_get("TRENCHES_YELLOWSTONE_TLS", "true").lower() != "false",
             pumpportal_url=_get("TRENCHES_PUMPPORTAL_URL", "wss://pumpportal.fun/api/data"),
+            pumpportal_strict=_get("TRENCHES_PUMPPORTAL_STRICT", "false").lower() == "true",
+            rugcheck_interval_seconds=_get_float("TRENCHES_RUGCHECK_INTERVAL_SECONDS", 2.0),
+            rugcheck_startup_max_age_seconds=_get_float(
+                "TRENCHES_RUGCHECK_STARTUP_MAX_AGE_SECONDS", 600.0
+            ),
             queue_maxsize=_get_int("TRENCHES_QUEUE_MAXSIZE", 10_000),
             workers=_get_int("TRENCHES_WORKERS", 4),
             dedupe_ttl_seconds=_get_int("TRENCHES_DEDUPE_TTL_SECONDS", 90),
@@ -151,7 +153,7 @@ class Config:
             for f in self.__slots__
             if f not in ("yellowstone_token", "dsn")
         }
-        out["yellowstone_token"] = "<set>" if self.yellowstone_token else "<empty>"
         out["dsn"] = "<set>"
+        out["feeds"] = list(self.feeds)
         out["replay_path"] = str(self.replay_path)
         return out

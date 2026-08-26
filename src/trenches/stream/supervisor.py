@@ -40,13 +40,16 @@ class Supervisor:
         self,
         factory: Callable[[], Consumer],
         *,
-        watchdog_seconds: float = 3.0,
+        watchdog_seconds: float | None = None,
         backoff_min: float = 1.0,
         backoff_max: float = 30.0,
         on_reconnect: Callable[[int, str], None] | None = None,
     ) -> None:
         self._factory = factory
-        self._watchdog_seconds = watchdog_seconds
+        #: None means "ask the consumer" -- a websocket feed and a gRPC slot
+        #: stream have honestly different liveness thresholds.
+        self._watchdog_override = watchdog_seconds
+        self._watchdog_seconds = watchdog_seconds or 120.0
         self._backoff_min = backoff_min
         self._backoff_max = backoff_max
         self._on_reconnect = on_reconnect
@@ -76,7 +79,7 @@ class Supervisor:
             idle = time.monotonic() - self._last_progress
             if idle > self._watchdog_seconds:
                 kv(
-                    log, logging.ERROR, "stream stalled; slots not advancing",
+                    log, logging.ERROR, "feed stalled; no frames received",
                     idle_seconds=round(idle, 2),
                     threshold_seconds=self._watchdog_seconds,
                     last_slot=self.max_slot,
@@ -89,6 +92,7 @@ class Supervisor:
         attempt = 0
         while True:
             consumer = self._factory()
+            self._watchdog_seconds = self._watchdog_override or consumer.idle_timeout_seconds
             self._last_progress = time.monotonic()
             queue: asyncio.Queue[RawEvent | BaseException | None] = asyncio.Queue(maxsize=1024)
 
@@ -117,10 +121,11 @@ class Supervisor:
                         reason = f"{type(item).__name__}: {item}"
                         break
                     attempt = 0  # a delivered event proves the connection works
-                    if item.slot > self.max_slot:
+                    if item.slot and item.slot > self.max_slot:
                         self.max_slot = item.slot
-                    if item.slot:
-                        self._last_progress = time.monotonic()
+                    # Any delivered frame is progress, including a ping. On a
+                    # websocket there is no slot number to key liveness on.
+                    self._last_progress = time.monotonic()
                     if item.event_kind != EventKind.PING:
                         yield item
             finally:

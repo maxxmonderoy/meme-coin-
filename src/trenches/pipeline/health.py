@@ -1,9 +1,9 @@
-"""Per-minute stream counters.
+"""Per-(minute, feed) counters.
 
-3.8.8: monitor DETECTION RATE, not just error rate. A decoder broken by a
-program layout change emits corrupt output rather than exceptions, so an
-error-rate monitor never fires. A sudden drop to zero creates is the canary,
-and it is only visible if creates are counted per minute rather than in total.
+3.8.8: monitor DETECTION RATE, not just error rate. A feed serving cached
+responses or a decoder broken by a schema change produces plausible output, not
+exceptions, so an error-rate monitor never fires. Counters are per-feed because
+the whole point of running two is noticing when one of them quietly stops.
 """
 from __future__ import annotations
 
@@ -22,68 +22,65 @@ class MinuteCounters:
     events_other: int = 0
     dupes: int = 0
     decode_failures: int = 0
+    schema_mismatches: int = 0
     queue_high_water: int = 0
     queue_drops: int = 0
     reconnects: int = 0
-    slot_gaps: int = 0
-    max_slot: int = 0
+    stale_responses: int = 0
+    wins: int = 0
 
 
 @dataclass(slots=True)
 class HealthTracker:
-    """Accumulates counters bucketed by minute, ready to flush to Postgres."""
+    buckets: dict[tuple[dt.datetime, str], MinuteCounters] = field(default_factory=dict)
 
-    buckets: dict[dt.datetime, MinuteCounters] = field(default_factory=dict)
-    last_slot: int = 0
-
-    def bucket(self, ts: dt.datetime | None = None) -> MinuteCounters:
+    def bucket(self, feed: str, ts: dt.datetime | None = None) -> MinuteCounters:
         ts = ts or dt.datetime.now(tz=dt.UTC)
-        return self.buckets.setdefault(_minute(ts), MinuteCounters())
+        return self.buckets.setdefault((_minute(ts), feed), MinuteCounters())
 
-    def record_event(self, kind: str, *, ts: dt.datetime | None = None) -> None:
-        b = self.bucket(ts)
+    def record_event(self, feed: str, kind: str, *, ts: dt.datetime | None = None) -> None:
+        b = self.bucket(feed, ts)
         b.events_total += 1
         if kind == "create":
             b.events_create += 1
         else:
             b.events_other += 1
 
-    def record_dupe(self, ts: dt.datetime | None = None) -> None:
-        self.bucket(ts).dupes += 1
+    def record_dupe(self, feed: str, ts: dt.datetime | None = None) -> None:
+        self.bucket(feed, ts).dupes += 1
 
-    def record_decode_failure(self, ts: dt.datetime | None = None) -> None:
-        self.bucket(ts).decode_failures += 1
+    def record_win(self, feed: str, ts: dt.datetime | None = None) -> None:
+        """This feed saw a mint first. The 3.2 upgrade-trigger evidence."""
+        self.bucket(feed, ts).wins += 1
 
-    def record_queue(self, depth: int, *, dropped: int = 0,
+    def record_decode_failure(self, feed: str, ts: dt.datetime | None = None) -> None:
+        self.bucket(feed, ts).decode_failures += 1
+
+    def record_schema_mismatch(self, feed: str, ts: dt.datetime | None = None) -> None:
+        self.bucket(feed, ts).schema_mismatches += 1
+
+    def record_stale(self, feed: str, ts: dt.datetime | None = None) -> None:
+        self.bucket(feed, ts).stale_responses += 1
+
+    def record_queue(self, feed: str, depth: int, *, dropped: int = 0,
                      ts: dt.datetime | None = None) -> None:
-        b = self.bucket(ts)
+        b = self.bucket(feed, ts)
         b.queue_high_water = max(b.queue_high_water, depth)
         b.queue_drops += dropped
 
-    def record_reconnect(self, ts: dt.datetime | None = None) -> None:
-        self.bucket(ts).reconnects += 1
+    def record_reconnect(self, feed: str, ts: dt.datetime | None = None) -> None:
+        self.bucket(feed, ts).reconnects += 1
 
-    def observe_slot(self, slot: int, *, ts: dt.datetime | None = None) -> int:
-        """Record a slot; return the size of any gap that opened.
+    def drain(
+        self, now: dt.datetime | None = None
+    ) -> list[tuple[tuple[dt.datetime, str], MinuteCounters]]:
+        """Return and clear every bucket except the one still being filled.
 
-        A gap is reported, not acted on. Solana genuinely skips slots when a
-        leader fails (3.8.5), so treating every gap as data loss pages
-        constantly and teaches you to ignore the page.
+        `now` is injectable so this is testable against a fixed clock rather
+        than against whatever time the suite happens to run at.
         """
-        b = self.bucket(ts)
-        gap = 0
-        if slot > self.last_slot:
-            if self.last_slot and slot > self.last_slot + 1:
-                gap = slot - self.last_slot - 1
-                b.slot_gaps += gap
-            self.last_slot = slot
-        b.max_slot = max(b.max_slot, slot)
-        return gap
-
-    def drain(self) -> list[tuple[dt.datetime, MinuteCounters]]:
-        """Return and clear all buckets except the current minute."""
-        current = _minute(dt.datetime.now(tz=dt.UTC))
-        ready = [(m, c) for m, c in sorted(self.buckets.items()) if m < current]
-        for minute, _ in ready:
-            del self.buckets[minute]
+        current = _minute(now or dt.datetime.now(tz=dt.UTC))
+        ready = [(k, v) for k, v in sorted(self.buckets.items()) if k[0] < current]
+        for key, _ in ready:
+            del self.buckets[key]
         return ready

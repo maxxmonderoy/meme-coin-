@@ -8,9 +8,11 @@ requires-python = ">=3.11,<3.13"
 # surface per CLAUDE.md 3.10, and the dominant control there is a time delay,
 # not a scanner. Do not add a dependency without reading its tree first.
 dependencies = [
+    # SQLite is the default store (3.2). asyncpg is kept so the Postgres swap
+    # is a connection-string change rather than a rewrite -- it is not used
+    # unless TRENCHES_DSN names postgres.
+    "aiosqlite>=0.20,<1",
     "asyncpg>=0.30,<0.32",
-    "grpcio>=1.68,<2",
-    "protobuf>=5.28,<8",
     "base58>=2.1,<3",
     "websockets>=13,<18",
     "httpx>=0.27,<1",
@@ -18,6 +20,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    # gRPC only matters when a 3.2 upgrade trigger fires and Yellowstone comes
+    # back; until then it is a dev-only dep so the $0 stack stays lean.
+    "grpcio>=1.68,<2",
+    "protobuf>=5.28,<8",
     "pytest>=8.3,<9",
     "pytest-asyncio>=0.24,<2",
     "grpcio-tools>=1.68,<2",

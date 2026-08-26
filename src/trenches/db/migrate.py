@@ -1,61 +1,66 @@
-"""Forward-only SQL migrations, applied in filename order.
-
-No down-migrations. At this stage the journal is small enough to rebuild and a
-half-applied rollback on the table holding your only evidence is a worse
-outcome than recreating it.
-"""
+"""Forward-only migrations, per dialect, applied in filename order."""
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 
-import asyncpg
-
 from ..log import get
+from .dialect import Database, iso
 
 log = get(__name__)
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[3] / "migrations"
+MIGRATIONS_ROOT = Path(__file__).resolve().parents[3] / "migrations"
 
 _BOOTSTRAP = """
 create table if not exists schema_migrations (
     version    text primary key,
-    applied_at timestamptz not null default now()
-);
+    applied_at text not null
+)
 """
 
 
-def discover(directory: Path | None = None) -> list[Path]:
-    return sorted((directory or MIGRATIONS_DIR).glob("*.sql"))
+def discover(dialect: str, root: Path | None = None) -> list[Path]:
+    directory = (root or MIGRATIONS_ROOT) / dialect
+    if not directory.is_dir():
+        raise FileNotFoundError(f"no migrations directory for dialect {dialect!r} at {directory}")
+    return sorted(directory.glob("*.sql"))
 
 
-async def applied_versions(conn: asyncpg.Connection) -> set[str]:
-    await conn.execute(_BOOTSTRAP)
-    rows = await conn.fetch("select version from schema_migrations")
-    return {r["version"] for r in rows}
+def _statements(sql: str) -> list[str]:
+    """Split on semicolons at statement level.
+
+    aiosqlite's execute() takes one statement at a time, and executescript()
+    commits implicitly, which would defeat the per-migration transaction.
+    """
+    out, buf = [], []
+    for line in sql.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("--") or not stripped:
+            continue
+        buf.append(line)
+        if stripped.endswith(";"):
+            out.append("\n".join(buf).rstrip().rstrip(";"))
+            buf = []
+    if buf:
+        out.append("\n".join(buf).rstrip().rstrip(";"))
+    return [s for s in out if s.strip()]
 
 
-async def migrate(pool: asyncpg.Pool, directory: Path | None = None) -> list[str]:
-    """Apply pending migrations. Returns the versions applied this run."""
-    files = discover(directory)
-    if not files:
-        raise FileNotFoundError(f"no .sql migrations found in {directory or MIGRATIONS_DIR}")
+async def migrate(db: Database, root: Path | None = None) -> list[str]:
+    await db.execute(_BOOTSTRAP)
+    done = {r["version"] for r in await db.fetch("select version from schema_migrations")}
 
     applied: list[str] = []
-    async with pool.acquire() as conn:
-        done = await applied_versions(conn)
-        for path in files:
-            version = path.stem
-            if version in done:
-                continue
-            log.info("applying migration %s", version)
-            # Each migration runs in its own transaction: a failure leaves the
-            # database at the last complete version rather than half-way.
-            async with conn.transaction():
-                await conn.execute(path.read_text())
-                await conn.execute(
-                    "insert into schema_migrations(version) values($1) "
-                    "on conflict (version) do nothing",
-                    version,
-                )
-            applied.append(version)
+    for path in discover(db.dialect, root):
+        version = path.stem
+        if version in done:
+            continue
+        log.info("applying migration %s (%s)", version, db.dialect)
+        for statement in _statements(path.read_text()):
+            await db.execute(statement)
+        await db.execute(
+            "insert into schema_migrations (version, applied_at) values (?, ?)",
+            version, iso(dt.datetime.now(tz=dt.UTC)),
+        )
+        applied.append(version)
     return applied
