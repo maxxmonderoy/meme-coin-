@@ -14,6 +14,10 @@ dependencies = [
     "aiosqlite>=0.20,<1",
     "asyncpg>=0.30,<0.32",
     "base58>=2.1,<3",
+    # Already in the tree as an httpx dependency; declared explicitly because
+    # stream/pumpportal.py now imports it directly to pin the TLS trust store.
+    # No new supply-chain surface (3.10) -- it was always being installed.
+    "certifi>=2024.7",
     "websockets>=13,<18",
     "httpx>=0.27,<1",
 ]

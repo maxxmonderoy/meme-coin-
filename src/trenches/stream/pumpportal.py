@@ -29,10 +29,12 @@ import asyncio
 import contextlib
 import datetime as dt
 import json
+import ssl
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import certifi
 import websockets
 
 from ..log import get
@@ -41,6 +43,30 @@ from .base import Consumer, EventKind, RawEvent
 log = get(__name__)
 
 WS_URL = "wss://pumpportal.fun/api/data"
+
+
+def _tls_context() -> ssl.SSLContext:
+    """Trust store pinned to certifi rather than whatever the host happens to have.
+
+    `websockets` defaults to `ssl.create_default_context()`, which on a python.org
+    macOS build loads ZERO certificate authorities until someone runs
+    `Install Certificates.command` by hand. The failure is
+    `CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate`, and the
+    supervisor treats it as a transient network fault and reconnects forever --
+    a feed that looks alive in the logs and never delivers a frame. That is the
+    §3.8.1 silent-stall class, arriving through TLS instead of a load balancer.
+
+    httpx does not have the problem because it already ships certifi, which is
+    why the RugCheck feed came up on the same run this one failed on. Binding
+    here makes the two consumers agree and makes the result independent of how
+    the host's Python was installed.
+    """
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+#: Built once. Contexts are reusable across connections and parsing the CA
+#: bundle on every reconnect would be wasted work during a backoff storm.
+TLS = _tls_context()
 
 #: Verified against the official README.
 SUBSCRIBE_NEW_TOKEN = {"method": "subscribeNewToken"}
@@ -60,17 +86,49 @@ class FrameSchema:
         return frozenset(self.required) | frozenset(self.optional)
 
 
-#: Field names reported by third-party write-ups, never by PumpPortal's own docs.
-#: `mint` and `signature` are required because without them the frame cannot be
-#: deduped or stored; everything else is optional so an upstream addition or
-#: rename degrades the record rather than dropping the launch.
+#: CORRECTED against 67 live `create` frames captured 2026-08-26 (75s window).
+#: What that capture changed, versus the third-hand write-ups this started from:
+#:
+#:   * `creator` does NOT exist. The signer arrives as `traderPublicKey`. This
+#:     matters for 3.4 stage 2: pump.fun's `create` takes `creator` as an
+#:     explicit argument distinct from the signer, so the reputation cache can
+#:     only be keyed on the signer from THIS feed. Getting the declared creator
+#:     needs the on-chain CreateEvent, not PumpPortal.
+#:   * `timestamp` does NOT exist. No frame carries an on-chain time, so
+#:     `block_time` is always None here and feed latency is measurable only as
+#:     relative arrival order, never as true launch-to-detection.
+#:   * `is_mayhem_mode` was undeclared and present in 65/67.
+#:
+#: THE FRAME SHAPE DEPENDS ON `pool`, which is the important finding:
+#: `subscribeNewToken` is not a pump.fun feed, it is a multi-launchpad feed.
+#: The capture carried pool=pump (65) and pool=bonk (2), and they do not agree
+#: on fields. pump carries bondingCurveKey / vTokensInBondingCurve /
+#: vSolInBondingCurve; bonk carries tokensInPool / newTokenBalance instead.
+#: A consumer that assumes the pump.fun curve will read garbage off a bonk
+#: launch -- 3.5's program IDs and curve maths apply to pump ONLY.
+#:
+#: `mint` and `signature` stay the only required fields even though eight are
+#: always present: required means "cannot be stored without", and keeping the
+#: rest optional means an upstream rename degrades a record instead of dropping
+#: a launch.
+#:
+#: STILL `verified=False` ON PURPOSE. 75 seconds is not seven days, and a
+#: window that short cannot show a rarer variant -- another pool, a migration
+#: frame, a field that only appears on some launches. The soak's capture is
+#: what should promote this. Re-run `trenches verify-capture` against it and
+#: flip this flag then.
 NEW_TOKEN_SCHEMA = FrameSchema(
     kind=EventKind.CREATE,
     required=("mint", "signature"),
     optional=(
-        "traderPublicKey", "txType", "name", "symbol", "uri", "initialBuy",
-        "solAmount", "bondingCurveKey", "vTokensInBondingCurve",
-        "vSolInBondingCurve", "marketCapSol", "pool", "creator", "timestamp",
+        # present in every observed frame
+        "traderPublicKey", "txType", "initialBuy", "solAmount", "marketCapSol",
+        "pool",
+        # pool=pump shape
+        "bondingCurveKey", "vTokensInBondingCurve", "vSolInBondingCurve",
+        "name", "symbol", "uri", "is_mayhem_mode",
+        # pool=bonk shape
+        "tokensInPool", "newTokenBalance",
     ),
     verified=False,
 )
@@ -194,11 +252,15 @@ class PumpPortalConsumer(Consumer):
             )
         async with self._in_use:
             self._recorder = self._open_recorder()
+            # ssl= is only meaningful for wss://; passing it for a plaintext
+            # ws:// URL (a local capture replay server) is an error.
+            tls = TLS if self._url.startswith("wss://") else None
             async with websockets.connect(
                 self._url,
                 ping_interval=self._keepalive_seconds,
                 ping_timeout=self._keepalive_seconds,
                 max_size=None,
+                ssl=tls,
             ) as ws:
                 self._ws = ws
                 await ws.send(json.dumps(SUBSCRIBE_NEW_TOKEN))
@@ -252,6 +314,9 @@ class PumpPortalConsumer(Consumer):
                 payload={"raw": frame, "schema_mismatch": str(exc)},
             )
 
+        # No `timestamp` appeared in any of the 67 captured frames, so this is
+        # always None in practice. Kept rather than deleted: if PumpPortal ever
+        # adds one, reading it is better than silently ignoring it.
         block_time = None
         ts = _as_int(frame.get("timestamp"))
         if ts and ts > 0:
@@ -281,6 +346,26 @@ class PumpPortalConsumer(Consumer):
             self._ws = None
 
 
+def _launchpad(pool: str | None) -> str | None:
+    """Resolve `pool` to a launchpad. It is NOT always pump.fun.
+
+    Hardcoding "pump.fun" here was wrong: the 2026-08-26 capture carried
+    pool=bonk alongside pool=pump, and mislabelling those poisons two things at
+    once -- the 3.4 stage-2 creator reputation table (a deployer's rug rate gets
+    attributed to the wrong launchpad) and any consumer that applies 3.5's
+    pump.fun curve maths to a token that is not on a pump.fun curve.
+
+    Unrecognised pools are stored marked rather than guessed at. Part 0 rule 2:
+    a plausible-sounding product name is worse than a gap, and a pool string we
+    have not traced to a program is exactly that gap.
+    """
+    if pool is None:
+        return None
+    if pool == "pump":
+        return "pump.fun"
+    return f"unverified:{pool}"
+
+
 def token_fields(frame: dict) -> dict:
     """Map a validated frame onto tokens_seen columns.
 
@@ -289,8 +374,15 @@ def token_fields(frame: dict) -> dict:
     """
     return {
         "signer": frame.get("traderPublicKey"),
-        "declared_creator": frame.get("creator") or frame.get("traderPublicKey"),
-        "launchpad": "pump.fun",
+        # NO fallback to the signer. `creator` never appears in this feed, so a
+        # fallback would write the signer into both columns and make the
+        # two-key stage-2 reputation cache an illusion -- it would look like it
+        # keyed on signer AND creator while keying on one value twice, which is
+        # exactly the rotation bypass keying on both was meant to stop. A null
+        # says truthfully that this feed does not carry it; the on-chain
+        # CreateEvent does.
+        "declared_creator": frame.get("creator"),
+        "launchpad": _launchpad(frame.get("pool")),
         "bonding_curve": frame.get("bondingCurveKey"),
         "name": frame.get("name"),
         "symbol": frame.get("symbol"),

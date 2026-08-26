@@ -28,6 +28,19 @@ GOOD_FRAME = {
     "txType": "create", "name": "Test", "symbol": "TST", "uri": "https://x/y",
     "initialBuy": 100000000, "solAmount": 1, "bondingCurveKey": "Curve111",
     "vTokensInBondingCurve": 900000000, "vSolInBondingCurve": 31, "marketCapSol": 32.7,
+    "is_mayhem_mode": False, "pool": "pump",
+}
+
+#: Verbatim from the 2026-08-26 capture, trimmed only in address length. The
+#: point of keeping a real one: `subscribeNewToken` is multi-launchpad, and a
+#: bonk frame does not carry the pump.fun curve fields at all. Anything that
+#: assumes the pump shape breaks here rather than in production.
+BONK_FRAME = {
+    "signature": "2iA1g5s5YQkjWW3BcSir56W5", "traderPublicKey": "9sHpTfmVpCfP2zexRNK6",
+    "txType": "create", "mint": "XsoCS1TfEyfFhfvj8EtZ528L",
+    "tokensInPool": 0.009875, "initialBuy": 999999999.990125, "solAmount": 0,
+    "newTokenBalance": 0, "marketCapSol": 6036.297585976846,
+    "name": "Bonk Mass Index", "symbol": "BMI", "uri": "https://x/y", "pool": "bonk",
 }
 
 
@@ -204,3 +217,51 @@ def test_replay_without_a_recorded_time_falls_back_to_now():
 
     event = ReplayConsumer._to_event({"provider": "x", "event_kind": "create", "mint": "M"})
     assert (dt.datetime.now(tz=dt.UTC) - event.received_at).total_seconds() < 5
+
+
+# -- the feed is multi-launchpad, measured 2026-08-26 -----------------------
+
+def test_bonk_frame_validates_despite_missing_pump_curve_fields():
+    """A non-pump launch is a launch, not a mismatch.
+
+    It arrives with tokensInPool/newTokenBalance and no bondingCurveKey. If the
+    schema ever demands the pump.fun curve fields, every bonk launch turns into
+    a null-mint OTHER row and the feed quietly loses part of its coverage.
+    """
+    event = PumpPortalConsumer().map_frame(dict(BONK_FRAME))
+    assert event.event_kind == EventKind.CREATE
+    assert event.mint == BONK_FRAME["mint"]
+
+
+def test_launchpad_is_never_hardcoded_to_pump():
+    """The bug this replaced attributed every launch to pump.fun."""
+    assert token_fields(GOOD_FRAME)["launchpad"] == "pump.fun"
+    assert token_fields(BONK_FRAME)["launchpad"] != "pump.fun"
+
+
+def test_unrecognised_pool_is_marked_not_guessed():
+    """Part 0 rule 2 -- a pool we have not traced to a program gets no name."""
+    fields = token_fields({**GOOD_FRAME, "pool": "somethingnew"})
+    assert fields["launchpad"] == "unverified:somethingnew"
+
+
+def test_declared_creator_does_not_fall_back_to_the_signer():
+    """Duplicating the signer into both columns fakes a two-key cache.
+
+    PumpPortal carries no `creator`, so this must be null rather than a copy --
+    otherwise stage 2 looks like it keys on signer AND creator while keying on
+    one value twice, which is the rotation bypass it exists to prevent.
+    """
+    fields = token_fields(GOOD_FRAME)
+    assert fields["signer"] == "Creator111"
+    assert fields["declared_creator"] is None
+
+    with_creator = token_fields({**GOOD_FRAME, "creator": "RealCreator222"})
+    assert with_creator["declared_creator"] == "RealCreator222"
+
+
+def test_bonk_amounts_never_become_floats():
+    """initialBuy arrives fractional on bonk; it must not reach an amount column."""
+    fields = token_fields(BONK_FRAME)
+    assert fields["initial_buy_base"] is None
+    assert fields["virtual_token_reserves"] is None

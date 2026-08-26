@@ -266,10 +266,30 @@ async def cmd_verify_capture(cfg: Config, args: argparse.Namespace) -> int:
     # recorded, not a hot path. An async filesystem shim would add a dependency
     # to save microseconds on a command that runs once.
     path = Path(args.path)
-    files = [path] if path.is_file() else sorted(path.glob("*.jsonl"))  # noqa: ASYNC240
+    if path.is_file():  # noqa: ASYNC240
+        files = [path]
+        skipped = []
+    else:
+        # ONLY the raw-wire captures. `--record` writes two different things
+        # into the same directory: `pumpportal-frames-*.jsonl` (what came off
+        # the socket, which is what a schema claim is about) and
+        # `events-*.jsonl` (RawEvent records this code already normalised).
+        # Globbing `*.jsonl` reads both, so the report scores our own output
+        # against PumpPortal's schema and reports `provider`, `slot` and
+        # `commitment` as undeclared PumpPortal fields. It inflates the frame
+        # count and dilutes the match rate with rows that were never frames.
+        files = sorted(path.glob("pumpportal-frames-*.jsonl"))  # noqa: ASYNC240
+        skipped = sorted(path.glob("events-*.jsonl"))  # noqa: ASYNC240
     if not files:
-        print(f"no .jsonl files under {path}", file=sys.stderr)
+        print(f"no pumpportal-frames-*.jsonl under {path}", file=sys.stderr)
+        if skipped:
+            print(f"({len(skipped)} events-*.jsonl found -- those are normalised "
+                  f"RawEvents, not raw frames, and prove nothing about the "
+                  f"upstream schema)", file=sys.stderr)
         return 2
+    if skipped:
+        print(f"reading {len(files)} raw-frame file(s); skipping {len(skipped)} "
+              f"events-*.jsonl (normalised, not raw)")
 
     report = ValidationReport()
     for file in files:
@@ -299,11 +319,14 @@ async def cmd_verify_capture(cfg: Config, args: argparse.Namespace) -> int:
         print("\nfields present that the schema does not declare (add to optional):")
         for name, count in sorted(report.unknown_fields.items(), key=lambda kv: -kv[1]):
             print(f"   {name:24s} seen in {count}/{report.frames} frames")
-    if report.absent_optional:
+    # Only fields absent from EVERY frame are wrong. A field missing from some
+    # frames is normal here: the shape varies by `pool`, so a pump-only field is
+    # legitimately absent from every bonk frame and vice versa.
+    never_seen = {n: c for n, c in report.absent_optional.items() if c == report.frames}
+    if never_seen:
         print("\ndeclared optional fields never seen (remove or rename):")
-        for name, count in sorted(report.absent_optional.items(), key=lambda kv: -kv[1]):
-            if count == report.frames:
-                print(f"   {name:24s} absent in ALL frames")
+        for name, count in sorted(never_seen.items(), key=lambda kv: -kv[1]):
+            print(f"   {name:24s} absent in ALL {count} frames")
     if report.matched == report.frames and not report.unknown_fields:
         print("\nSchema confirmed. Set NEW_TOKEN_SCHEMA.verified = True in "
               "src/trenches/stream/pumpportal.py")

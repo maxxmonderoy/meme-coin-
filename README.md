@@ -91,24 +91,57 @@ age** — the Python analogue of §3.10.3, and the one control in the incident
 record that never failed. No Node, no npm, no install scripts. `.env` and
 `*.local.conf` are gitignored.
 
-## Endpoint paths that are NOT independently verified
+## Endpoint paths — all verified 2026-08-26
 
-Every feed and vendor host was unreachable from the environment this was built
-in, so the following URLs come from CLAUDE.md or from general knowledge rather
-than from a live response. They are the most likely thing to be wrong on a
-first run, and each is a one-line change:
+Every host was unreachable from the environment this was built in, so these
+started as guesses. All of them have now answered a live request:
 
-| Where | Path | Sourced from |
+| Where | Path | Status |
 |---|---|---|
-| `stream/pumpportal.py` | `wss://pumpportal.fun/api/data` + `subscribeNewToken` | **verified** — PumpPortal's own repo |
-| `stream/pumpportal.py` | response field names | third-hand write-ups only |
-| `stream/rugcheck_feed.py` | `/v1/stats/new_tokens` | CLAUDE.md §3.2 |
-| `stream/rugcheck_feed.py` | entry shape and timestamp key | guessed; several variants tried |
-| `enrich/rugcheck.py` | `/v1/tokens/{mint}/report` | CLAUDE.md §2 |
-| `enrich/goplus.py` | `https://api.gopluslabs.io/api/v1/solana/token_security` | **general knowledge, not sourced** |
+| `stream/pumpportal.py` | `wss://pumpportal.fun/api/data` + `subscribeNewToken` | **verified** — 67 `create` frames received |
+| `stream/pumpportal.py` | response field names | **corrected** — see below; two names were wrong |
+| `stream/rugcheck_feed.py` | `/v1/stats/new_tokens` | **verified** — 200, newest entry 3.4s old |
+| `stream/rugcheck_feed.py` | entry shape and timestamp key | **verified** — freshness check resolves it |
+| `enrich/rugcheck.py` | `/v1/tokens/{mint}/report` | **verified** — 200 in 779ms |
+| `enrich/goplus.py` | `https://api.gopluslabs.io/api/v1/solana/token_security` | **verified** — 200 in 1234ms, written from recall and correct |
 
-The GoPlus one is the weakest: it was written from recall, not from a document.
-Treat it as a placeholder until a real response confirms it.
+**TLS had to be fixed first.** `websockets` uses `ssl.create_default_context()`,
+which on a python.org macOS build loads **zero** CAs until someone runs
+`Install Certificates.command` by hand. PumpPortal failed every connect with
+`CERTIFICATE_VERIFY_FAILED` while the supervisor logged healthy exponential
+backoff and reconnected forever — a §3.8.1 silent stall arriving through TLS.
+RugCheck was unaffected because httpx already ships certifi. The PumpPortal
+consumer now pins the same trust store explicitly, so both feeds agree and the
+result no longer depends on how the host's Python was installed.
+
+## The schema was wrong in three ways
+
+`verify-capture` over 67 live frames:
+
+- **`creator` does not exist.** The signer arrives as `traderPublicKey`. pump.fun's
+  `create` takes `creator` as an argument distinct from the signer, so §3.4
+  stage 2 can only key on the signer from this feed — the declared creator needs
+  the on-chain `CreateEvent`. `declared_creator` is now **null** rather than a
+  copy of the signer: duplicating it made a two-key cache that keyed one value
+  twice, which is precisely the rotation bypass keying on both was meant to stop.
+- **`timestamp` does not exist.** No frame carries an on-chain time, so
+  `block_time` is always null here and feed latency is measurable only as
+  relative arrival order — never as true launch-to-detection.
+- **`is_mayhem_mode` was undeclared**, present in 65 of 67.
+
+**And the finding that matters most: `subscribeNewToken` is not a pump.fun feed.**
+The capture carried `pool=pump` (65) and `pool=bonk` (2), and **they do not agree
+on fields** — pump carries `bondingCurveKey`/`vTokensInBondingCurve`/
+`vSolInBondingCurve`, bonk carries `tokensInPool`/`newTokenBalance` instead.
+`token_fields` hardcoded `launchpad = "pump.fun"` for every frame, which
+mislabels every non-pump launch, misattributes its deployer in the stage-2
+reputation table, and invites §3.5's pump.fun curve maths onto a token that is
+not on a pump.fun curve. Pools other than `pump` are now stored as
+`unverified:<pool>` rather than given a guessed product name.
+
+The schema is **still `verified=False`** on purpose: 75 seconds is not seven
+days and cannot show a rarer variant. The soak's capture is what should promote
+it.
 
 Note the install above must be **editable** (`-e .`). Migrations are read from
 the repo's `migrations/` directory relative to the source tree, so a regular
@@ -117,8 +150,8 @@ install would not find them.
 ## Not done yet
 
 - **The seven-day soak has not run.** That is the actual week-1 deliverable.
-- **PumpPortal's schema is unconfirmed** — `verify-capture` exists precisely to
-  close that, and needs real recorded frames.
+- **PumpPortal's schema is corrected but not promoted** — it matches 67/67 live
+  frames; flip `NEW_TOKEN_SCHEMA.verified` once the soak's capture agrees.
 - **`n_rugged` is never written.** `creators` counts mints as an ingest
   byproduct, but nothing labels rugs yet, so §3.4 stage 2's
   `n_mints >= 3 AND rug_rate >= 0.6` cannot fire. That is week-2 work and it
