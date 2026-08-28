@@ -36,6 +36,14 @@ build/
 *.sqlite
 *.sqlite3
 *.db
+# SQLite's WAL sidecars. `*.db` does not match these, and in WAL mode they are
+# live files that change on every write -- committing one put a 15 MB blob in
+# the history and leaked collected data that this section exists to keep local.
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite-wal
+*.sqlite-shm
 *.dump
 *.sql.gz
 data/

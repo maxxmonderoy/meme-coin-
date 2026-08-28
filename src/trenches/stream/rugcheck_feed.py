@@ -201,7 +201,14 @@ class RugCheckNewTokensConsumer(Consumer):
 def token_fields(entry: dict) -> dict:
     """Map a listing entry onto tokens_seen columns."""
     return {
-        "launchpad": entry.get("launchpad") or entry.get("program"),
+        # NO fallback to `program`. That field is the SPL Token / Token-2022
+        # program the mint is owned by, not a launchpad, and it is already
+        # stored verbatim as program_id below. The fallback put a token program
+        # ID into a column meaning "which launchpad launched this" for 21.6% of
+        # rows -- every one an exact duplicate of program_id, so it carried no
+        # information and only made `group by launchpad` wrong. Part 0 rule 2:
+        # a gap beats an invented value.
+        "launchpad": entry.get("launchpad"),
         "name": entry.get("name") or (entry.get("fileMeta") or {}).get("name"),
         "symbol": entry.get("symbol") or (entry.get("fileMeta") or {}).get("symbol"),
         "uri": entry.get("uri") or entry.get("metadataUri"),

@@ -127,8 +127,10 @@ NEW_TOKEN_SCHEMA = FrameSchema(
         # pool=pump shape
         "bondingCurveKey", "vTokensInBondingCurve", "vSolInBondingCurve",
         "name", "symbol", "uri", "is_mayhem_mode",
-        # pool=bonk shape
-        "tokensInPool", "newTokenBalance",
+        # pool=bonk shape. `solInPool` appeared in 82 of 33,979 frames -- it
+        # did not exist in the first 67 and is exactly the rare variant that
+        # kept this schema at verified=False.
+        "tokensInPool", "newTokenBalance", "solInPool",
     ),
     verified=False,
 )

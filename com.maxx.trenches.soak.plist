@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.maxx.trenches.soak</string>
+
+    <!-- caffeinate -is wraps the collector so the machine will not idle-sleep
+         mid-soak. Sleeping loses launches outright: this feed is live-only and
+         nothing can backfill the hours the socket was down. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-is</string>
+        <string>/Users/Maxx/trenches/.venv/bin/trenches</string>
+        <string>stream</string>
+        <string>--record</string>
+        <string>captures/</string>
+    </array>
+
+    <!-- Required, not cosmetic. TRENCHES_DSN is sqlite://./trenches.db and the
+         env file path is relative, so a different cwd silently creates a second
+         empty database somewhere else. -->
+    <key>WorkingDirectory</key>
+    <string>/Users/Maxx/trenches</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TRENCHES_ENV_FILE</key>
+        <string>trenches.local.conf</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restarts the collector if it exits, including after a reboot once the
+         agent is loaded. launchd only restarts a process that has fully exited,
+         so this cannot produce two concurrent PumpPortal connections -- which
+         would earn an hourly ban. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Do not hammer a feed that is refusing us. The app has its own 1-30s
+         backoff; this is the outer guard on crash-restart loops. -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Maxx/trenches/logs/soak.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/Maxx/trenches/logs/soak.log</string>
+</dict>
+</plist>
