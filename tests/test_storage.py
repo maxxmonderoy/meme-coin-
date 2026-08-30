@@ -216,3 +216,65 @@ async def test_decisions_reject_must_carry_a_stage(any_db):
             "insert into decisions (mint, mode, outcome, inputs, thresholds, "
             "code_version, decided_at) values ('M-REJ','PAPER','reject','{}','{}','v', ?)",
             iso(dt.datetime.now(tz=dt.UTC)))
+
+
+# -- outcomes migration on a populated database ----------------------------
+
+async def test_002_applies_cleanly_to_a_populated_database(any_db):
+    """The acceptance condition: it must land on a database that already has
+    data, without touching it. 002 adds tables and no column of an existing
+    one, so this asserts the existing rows survive untouched."""
+    import datetime as dt
+
+    from trenches.db.dialect import iso
+
+    stream_id = await repo.open_stream(
+        any_db, feeds=["pumpportal"], subscription={}, code_version="test",
+    )
+    mint = pubkey(200)
+    await repo.upsert_token(
+        any_db, mint=mint, stream_id=stream_id, feed="pumpportal",
+        fields={"symbol": "KEEP", "signer": pubkey(201)},
+    )
+    before = await repo.get_token(any_db, mint)
+
+    from trenches.db import migrate as migrate_mod
+    assert await migrate_mod.migrate(any_db) == []  # already applied, idempotent
+
+    after = await repo.get_token(any_db, mint)
+    assert after["symbol"] == before["symbol"] == "KEEP"
+
+    # and the new tables accept a row keyed to the pre-existing mint
+    now = dt.datetime.now(tz=dt.UTC)
+    assert await repo.record_outcome(any_db, mint=mint, horizon="15m", fields={
+        "scheduled_for": iso(now), "observed_at": iso(now), "status": "no_pool",
+        "ambiguous_no_pool": True, "source": "none", "pool_found": False,
+    })
+    rows = await repo.outcomes_for_mint(any_db, mint)
+    assert len(rows) == 1 and rows[0]["status"] == "no_pool"
+
+
+async def test_outcome_row_round_trips_every_column(any_db):
+    import datetime as dt
+
+    from trenches.db.dialect import iso
+
+    stream_id = await repo.open_stream(
+        any_db, feeds=["pumpportal"], subscription={}, code_version="test")
+    mint = pubkey(202)
+    await repo.upsert_token(any_db, mint=mint, stream_id=stream_id, feed="pumpportal", fields={})
+    now = dt.datetime.now(tz=dt.UTC)
+    await repo.record_outcome(any_db, mint=mint, horizon="24h", fields={
+        "scheduled_for": iso(now), "observed_at": iso(now), "lateness_seconds": 7200,
+        "status": "alive", "ambiguous_no_pool": False, "backfilled": True,
+        "source": "dexscreener", "pool_found": True,
+        "price_usd": "0.000000001234", "liquidity_usd": "12345.6",
+        "fdv_usd": "999", "market_cap_usd": "888", "txns_h24_buys": 5,
+        "txns_h24_sells": 6, "dex_id": "raydium", "payload": {"a": 1},
+    })
+    row = (await repo.outcomes_for_mint(any_db, mint))[0]
+    # the exact decimal string survives -- no float anywhere in the path
+    assert row["price_usd"] == "0.000000001234"
+    assert row["liquidity_usd"] == "12345.6"
+    assert row["lateness_seconds"] == 7200
+    assert row["backfilled"] == 1 or row["backfilled"] is True

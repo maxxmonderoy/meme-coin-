@@ -102,8 +102,8 @@ async def any_db(request, tmp_path):
         if not POSTGRES_DSN:
             pytest.skip("set TRENCHES_TEST_POSTGRES_DSN to run the Postgres pass")
         db = await pool_mod.connect(POSTGRES_DSN)
-        for table in ("decisions", "enrich_cache", "feed_health", "feed_latency",
-                      "raw_events", "tokens_seen", "creators", "streams",
+        for table in ("outcomes", "mint_peaks", "decisions", "enrich_cache", "feed_health",
+                      "feed_latency", "raw_events", "tokens_seen", "creators", "streams",
                       "schema_migrations"):
             await db.execute(f"drop table if exists {table} cascade")
     else:

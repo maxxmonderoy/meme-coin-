@@ -84,6 +84,11 @@ class Config:
     raw_retention_days: int
     rugcheck_base: str
     enrich_cache_ttl_seconds: int
+    label_interval_seconds: float
+    label_batch_limit: int
+    label_fallback_budget: int
+    label_dead_liquidity_usd: float
+    label_peak_multiple: float
     log_level: str = field(default="INFO")
 
     @staticmethod
@@ -136,6 +141,11 @@ class Config:
             raw_retention_days=_get_int("TRENCHES_RAW_RETENTION_DAYS", 7),
             rugcheck_base=_get("TRENCHES_RUGCHECK_BASE", "https://api.rugcheck.xyz/v1"),
             enrich_cache_ttl_seconds=_get_int("TRENCHES_ENRICH_CACHE_TTL_SECONDS", 300),
+            label_interval_seconds=_get_float("TRENCHES_LABEL_INTERVAL_SECONDS", 60.0),
+            label_batch_limit=_get_int("TRENCHES_LABEL_BATCH_LIMIT", 500),
+            label_fallback_budget=_get_int("TRENCHES_LABEL_FALLBACK_BUDGET", 100),
+            label_dead_liquidity_usd=_get_float("TRENCHES_LABEL_DEAD_LIQUIDITY_USD", 1000.0),
+            label_peak_multiple=_get_float("TRENCHES_LABEL_PEAK_MULTIPLE", 2.0),
             log_level=_get("TRENCHES_LOG_LEVEL", "INFO"),
         )
         if cfg.workers < 1:

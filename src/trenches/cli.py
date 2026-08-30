@@ -95,6 +95,23 @@ async def cmd_stream(cfg: Config, args: argparse.Namespace) -> int:
     flusher = asyncio.create_task(ingest.health_flusher(), name="health")
     consume = asyncio.create_task(ingest.consume(mux.run()), name="consume")
 
+    # The labeler runs as a SIBLING with its own database connection, never
+    # sharing ingest's. run_forever() swallows every exception, so a labeler
+    # that crashes in a loop costs log lines and nothing else -- ingest is
+    # collecting data that cannot be recovered later and must not be at risk
+    # from a reporting job.
+    label_db = None
+    label_task = None
+    if getattr(args, "label", False):
+        from .label.labeler import run_forever
+
+        label_db = await pool_mod.connect(cfg.dsn)
+        label_task = asyncio.create_task(
+            run_forever(_labeler(cfg, label_db), interval_seconds=cfg.label_interval_seconds),
+            name="labeler",
+        )
+        logmod.kv(log, 20, "labeler started alongside ingest", isolated_connection=True)
+
     shutdown = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -119,6 +136,12 @@ async def cmd_stream(cfg: Config, args: argparse.Namespace) -> int:
         for w in workers:
             w.cancel()
         flusher.cancel()
+        if label_task is not None:
+            label_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await label_task
+        if label_db is not None:
+            await label_db.close()
         await asyncio.gather(*workers, flusher, return_exceptions=True)
         await ingest.final_flush()
         if recorder:
@@ -131,9 +154,13 @@ async def cmd_stream(cfg: Config, args: argparse.Namespace) -> int:
 
 
 async def cmd_stats(cfg: Config, args: argparse.Namespace) -> int:
+    from .label import HORIZON_SECONDS, HORIZONS
+
     db = await pool_mod.connect(cfg.dsn)
     try:
         data = await repo.stats(db, hours=args.hours)
+        coverage = await repo.outcome_coverage(db, HORIZONS)
+        due = {h: await repo.due_count(db, h, HORIZON_SECONDS[h]) for h in HORIZONS}
     finally:
         await db.close()
 
@@ -188,6 +215,22 @@ async def cmd_stats(cfg: Config, args: argparse.Namespace) -> int:
             print(f"    {row['first_feed']:<14} {wins:>7,} wins ({wins / total:>5.1%})  {lead}")
         print("\n  Read this before ever paying for a faster feed: a feed that never wins,")
         print("  or wins by milliseconds you cannot act on, is not worth upgrading.")
+
+    total_rows = sum(v["observed"] for v in coverage["horizons"].values())
+    print(f"\n  OUTCOME LABELING -- {total_rows:,} observations over "
+          f"{coverage['total_tokens']:,} mints")
+    for horizon in HORIZONS:
+        bucket = coverage["horizons"][horizon]
+        split = " ".join(f"{k}={v:,}" for k, v in sorted(bucket["status"].items())) or "-"
+        venue = " ".join(f"{k}={v:,}" for k, v in sorted(bucket["venue"].items())) or "-"
+        print(f"    {horizon:<4} observed={bucket['observed']:>7,} "
+              f"backfilled={bucket['backfilled']:>7,} "
+              f"due_unobserved={due[horizon]:>7,}   {split}")
+        print(f"         venue: {venue}")
+    print("    no_pool is a LABEL, not a collection failure: most launches never "
+          "become tradeable.")
+    print("    venue: bonding_curve is NOT graduation -- every launch has a curve "
+          "from birth (1.3).")
     return 0
 
 
@@ -209,6 +252,28 @@ async def cmd_inspect(cfg: Config, args: argparse.Namespace) -> int:
                       f"rugged={h['n_rugged']} rug_rate={h['rug_rate']}")
             if row.get("signer") and row.get("signer") != row.get("declared_creator"):
                 print("  ** signer != declared_creator: reputation must consider both")
+
+            outcomes = await repo.outcomes_for_mint(db, args.mint)
+            peak = await repo.peak_for_mint(db, args.mint)
+            print("\n-- outcomes --")
+            if not outcomes:
+                print("  none recorded yet (horizon not due, or labeler has not run)")
+            for o in outcomes:
+                late = int(o["lateness_seconds"] or 0)
+                flags = []
+                if o["ambiguous_no_pool"]:
+                    flags.append("AMBIGUOUS(not-yet-indexed vs never-had-a-pool)")
+                if o["backfilled"]:
+                    flags.append("backfilled")
+                if late > 60:
+                    flags.append(f"late by {late // 60}m")
+                print(f"  {o['horizon']:<4} {o['status']:<8} "
+                      f"liq={o['liquidity_usd'] or '-':>12} price={o['price_usd'] or '-':>14} "
+                      f"{' '.join(flags)}")
+            if peak:
+                print(f"  peak  max_price_seen={peak['max_price_usd_seen']} "
+                      f"over {peak['observations']} observations")
+                print("        LOWER BOUND on the true peak -- we sample, we do not stream.")
         else:
             print(f"{args.mint} not in tokens_seen")
 
@@ -373,6 +438,115 @@ async def cmd_prune(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _labeler(cfg: Config, db, *, backfill: bool = False):
+    """Build a Labeler. Kept here so cmd_label and cmd_stream agree exactly."""
+    from .enrich.rugcheck import RugCheckClient
+    from .label.dexscreener import DexScreenerClient
+    from .label.labeler import Labeler
+
+    return Labeler(
+        db,
+        client=DexScreenerClient(),
+        rugcheck=RugCheckClient(cfg.rugcheck_base),
+        dead_liquidity_usd=cfg.label_dead_liquidity_usd,
+        batch_limit=cfg.label_batch_limit,
+        fallback_budget=cfg.label_fallback_budget,
+        backfill=backfill,
+    )
+
+
+async def cmd_label(cfg: Config, args: argparse.Namespace) -> int:
+    """Run the outcome labeler on its own. Never touches the feed path."""
+    from .label.labeler import run_forever
+
+    db = await pool_mod.connect(cfg.dsn)
+    labeler = _labeler(cfg, db, backfill=args.backfill)
+    try:
+        backlog = await labeler.backlog()
+        print("backlog by horizon: " + ", ".join(f"{h}={n:,}" for h, n in backlog.items()))
+        if args.once:
+            observed = await labeler.tick()
+            print(f"observed {observed:,} horizons "
+                  f"({labeler.stats.requests} requests, "
+                  f"no_pool={labeler.stats.no_pool} alive={labeler.stats.alive} "
+                  f"dead={labeler.stats.dead})")
+            return 0
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError):
+                loop.add_signal_handler(sig, stop.set)
+        runner = asyncio.create_task(
+            run_forever(labeler, interval_seconds=cfg.label_interval_seconds, stop=stop)
+        )
+        await stop.wait()
+        runner.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await runner
+        print(f"stopped. observed {labeler.stats.observed:,} horizons over "
+              f"{labeler.stats.ticks} ticks")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_rules_report(cfg: Config, args: argparse.Namespace) -> int:
+    """What each hypothetical rejection rule would have cost.
+
+    Runs with zero `decisions` rows on purpose -- week 1 has none, and the
+    report has to work the moment stage gating lands rather than after it.
+    """
+    from decimal import Decimal
+
+    from .label import HORIZON_SECONDS
+    from .label.rules import RULES, evaluate, is_late
+
+    db = await pool_mod.connect(cfg.dsn)
+    try:
+        rows = await repo.rule_evaluation_rows(db)
+        all_labeled = [r for r in rows if r.get("status_24h") or r.get("status_7d")
+                       or r.get("status_15m")]
+        if not args.include_stale:
+            # A 15m label observed later than 15m after the fact is a
+            # "what does it look like now" reading wearing a 15m name.
+            rows = [r for r in rows if not is_late(r, HORIZON_SECONDS["15m"], "lateness_15m")]
+        labeled = [r for r in rows if r.get("status_24h") or r.get("status_7d")
+                   or r.get("status_15m")]
+        dropped = len(all_labeled) - len(labeled)
+        print(f"candidates: {len(rows):,}   with at least one outcome: {len(labeled):,}")
+        if dropped:
+            print(f"excluded as stale: {dropped:,} -- observed later than the horizon itself, "
+                  f"so the label is nominal only. --include-stale to keep them.")
+        if not labeled:
+            if all_labeled:
+                print("\nEvery outcome on record was excluded as stale. These are backfilled "
+                      "observations of mints whose horizon passed long ago: real data, but a "
+                      "15m label taken days late is a 'what does it look like now' reading. "
+                      "Re-run with --include-stale to score them anyway, or wait for the "
+                      "labeler to observe mints on schedule.")
+            else:
+                print("\nNo outcomes recorded yet. Run `trenches label` first -- the report is "
+                      "structurally fine, it just has nothing to score.")
+            return 0
+        threshold = Decimal(str(args.peak_multiple or cfg.label_peak_multiple))
+        print(f"a rejection is WRONG when the token later reached >= {threshold}x its 15m price\n")
+        header = (f"  {'rule':22} {'stage':>5} {'rejects':>9} {'correct':>8} "
+                  f"{'wrong':>7} {'?':>7} {'prec':>6}")
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+        for out in evaluate(labeled, rules=RULES, peak_threshold=threshold):
+            prec = out.precision()
+            print(f"  {out.name:22} {out.stage:>5} {out.rejected:>9,} {out.correct:>8,} "
+                  f"{out.wrong:>7,} {out.undeterminable:>7,} "
+                  f"{'n/a' if prec is None else f'{prec:.1%}':>6}")
+        print("\n  correct = rejected and it ended no_pool/dead")
+        print("  wrong   = rejected and it reached the peak multiple")
+        print("  ?       = rejected, outcome not determinable -- NOT counted as success")
+    finally:
+        await db.close()
+    return 0
+
+
 # -- entry point -----------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -387,6 +561,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     stream = sub.add_parser("stream", help="run the ingest loop across all configured feeds")
     stream.add_argument("--record", metavar="DIR", help="also write events to JSONL for replay")
+    stream.add_argument("--label", action="store_true",
+                        help="also run the outcome labeler, isolated from ingest")
+
+    label = sub.add_parser("label", help="observe recorded mints at fixed horizons")
+    label.add_argument("--once", action="store_true", help="a single pass, then exit")
+    label.add_argument("--backfill", action="store_true",
+                       help="mark rows as observed after the fact")
+
+    rules_report = sub.add_parser(
+        "rules-report", help="what each hypothetical rejection rule would have cost")
+    rules_report.add_argument("--peak-multiple", type=float, default=None)
+    rules_report.add_argument("--include-stale", action="store_true",
+                              help="include horizons observed later than the horizon itself")
 
     stats = sub.add_parser("stats", help="events/hour, uniques, dupes, feed race, detection rate")
     stats.add_argument("--hours", type=float, default=24)
@@ -412,6 +599,7 @@ HANDLERS = {
     "migrate": cmd_migrate, "stream": cmd_stream, "stats": cmd_stats,
     "inspect": cmd_inspect, "verify-capture": cmd_verify_capture,
     "idl-check": cmd_idl_check, "prune": cmd_prune,
+    "label": cmd_label, "rules-report": cmd_rules_report,
 }
 
 

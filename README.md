@@ -72,6 +72,62 @@ is what makes the race measurable.
 and `creator` as distinct pubkeys. The stage-2 reputation cache keys on **both**,
 because one keyed on either alone is bypassed by rotating the other.
 
+## Outcome labeling
+
+For every mint we record, snapshot what actually happened to it at **15m, 1h,
+24h and 7d**. This is the one part of the system that is time-irreversible:
+code can be added in week 9 with no penalty, but nobody stores what happened to
+the tokens launching right now, so an outcome not collected today cannot be
+collected later.
+
+```bash
+trenches label --once          # one pass
+trenches label                 # supervised loop
+trenches stream --label        # alongside ingest, isolated from it
+trenches rules-report          # what each rejection rule would have cost
+```
+
+**`no_pool` is a label, not a collection failure.** Most launches never become
+tradeable, and recording that is the point: an unlabeled journal cannot tell a
+filter that killed a corpse from one that killed a winner.
+
+**A bonding curve is not a graduated pool.** The first live run marked 30% of
+15-minute observations `alive` against a documented graduation rate under 1%.
+The cause: RugCheck's `markets` array is dominated by `marketType: pump_fun` --
+275 of 305 markets in the first sample -- which is the launch curve every
+pump.fun token has from birth, not a pool it graduated into. Counting those as
+pools made `alive` mean "this token exists". `venue_kind` now separates
+`bonding_curve` from `dex`, and with that split the measured graduation rate came
+out at **6.67%**, against §1.3's post-BOOST 6.7%. A curve is still genuinely
+tradeable, so it is not called dead -- the two are simply different questions.
+
+This is also why DexScreener answered for only 24 of 450 observations while
+RugCheck answered for 74: DexScreener indexes *graduated* pools. Its silence was
+never "no pool", it was "not graduated" -- which is a complete label on its own,
+and why the RugCheck fallback now runs only at 15m and 1h where "not indexed
+yet" is still plausible.
+
+**`max_price_usd_seen` is a lower bound.** We sample at four horizons; we do not
+stream prices. It answers "did this reach at least X", never "how high did it
+get".
+
+**Late is fine, missing is not.** A 24h label taken at 26h is usable data and
+records both `scheduled_for` and `observed_at`. A 15m label backfilled three
+days late is a "what does it look like now" reading wearing a 15m name, so
+`rules-report` excludes rows observed later than their own horizon unless you
+pass `--include-stale`.
+
+**The report is the reason the rest exists.** It asks which rejection rules earn
+their keep. A rejection whose outcome cannot be determined is counted as `?`,
+never as a success -- folding missing data into "correctly killed" is how a
+filter proves itself against an empty journal. `unknown_launchpad` is shipped as
+a deliberate control: a rule that scores no better than it is a coin flip.
+
+Rate limiting is a token bucket at 60 req/min shared across DexScreener
+endpoints, because the case that gets an IP banned is the backlog burst after an
+outage, not the steady state. Batch size is 25, set below the 30 whose
+correctness was verified by a union test on 2026-08-30.
+
 ## Storage
 
 SQLite with WAL. Amounts are stored as exact-integer **TEXT**, not INTEGER:

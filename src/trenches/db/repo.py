@@ -7,6 +7,7 @@ no dialect-specific casts. Time cutoffs and percentiles are computed in Python.
 from __future__ import annotations
 
 import datetime as dt
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from ..stream.base import RawEvent
@@ -313,3 +314,196 @@ async def cached_enrichment(
     if row:
         row["payload"] = loads(row["payload"])
     return row
+
+
+# -- outcomes --------------------------------------------------------------
+#
+# Read-only observation of what happened to a mint. Nothing here touches the
+# ingest path: the labeler holds its own connection and these statements are
+# never called from a feed worker.
+
+async def due_horizons(
+    db: Database, horizon: str, horizon_seconds: int, *, limit: int = 500
+) -> list[dict]:
+    """Mints whose `horizon` came due and which have no row for it yet.
+
+    Due-ness is derived rather than queued. A queue table would be a second
+    source of truth that drifts from tokens_seen the first time a backfill runs.
+
+    The cutoff is computed in Python and bound as a parameter -- SQLite has no
+    interval type, so date arithmetic in SQL would not survive the Postgres
+    swap in either direction (dialect.py).
+    """
+    cutoff = iso(_now() - dt.timedelta(seconds=horizon_seconds))
+    return await db.fetch(
+        "select t.mint, t.detected_at from tokens_seen t "
+        "left join outcomes o on o.mint = t.mint and o.horizon = ? "
+        "where t.detected_at <= ? and o.mint is null "
+        "order by t.detected_at asc limit ?",
+        horizon, cutoff, limit,
+    )
+
+
+async def record_outcome(db: Database, *, mint: str, horizon: str, fields: dict) -> bool:
+    """Write one observation. Returns False if (mint, horizon) already existed.
+
+    `on conflict do nothing` rather than an upsert: a horizon is observed once.
+    Re-observing it later would overwrite a measurement taken at the right time
+    with one taken at the wrong time, which is the whole failure this table
+    exists to avoid.
+    """
+    status = await db.execute(
+        "insert into outcomes "
+        "(mint, horizon, scheduled_for, observed_at, lateness_seconds, status, "
+        " ambiguous_no_pool, backfilled, source, pool_found, price_usd, liquidity_usd, "
+        " fdv_usd, market_cap_usd, volume_m5, volume_h1, volume_h24, "
+        " txns_m5_buys, txns_m5_sells, txns_h1_buys, txns_h1_sells, "
+        " txns_h24_buys, txns_h24_sells, price_change_h24, pair_address, "
+        " pair_created_at, dex_id, venue_kind, market_type, attempts, error, payload) "
+        "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+        "        ?, ?, ?, ?, ?, ?, ?) "
+        "on conflict (mint, horizon) do nothing",
+        mint, horizon, fields["scheduled_for"], fields["observed_at"],
+        fields.get("lateness_seconds", 0), fields["status"],
+        1 if fields.get("ambiguous_no_pool") else 0,
+        1 if fields.get("backfilled") else 0,
+        fields.get("source", "none"), 1 if fields.get("pool_found") else 0,
+        fields.get("price_usd"), fields.get("liquidity_usd"), fields.get("fdv_usd"),
+        fields.get("market_cap_usd"), fields.get("volume_m5"), fields.get("volume_h1"),
+        fields.get("volume_h24"), fields.get("txns_m5_buys"), fields.get("txns_m5_sells"),
+        fields.get("txns_h1_buys"), fields.get("txns_h1_sells"), fields.get("txns_h24_buys"),
+        fields.get("txns_h24_sells"), fields.get("price_change_h24"),
+        fields.get("pair_address"), fields.get("pair_created_at"), fields.get("dex_id"),
+        fields.get("venue_kind"), fields.get("market_type"),
+        fields.get("attempts", 1), fields.get("error"), dumps(fields.get("payload")),
+    )
+    return not status.endswith(" 0")
+
+
+async def bump_peak(
+    db: Database, mint: str, *, price_usd: str | None, liquidity_usd: str | None, observed_at: str
+) -> None:
+    """Update the running maximum for a mint.
+
+    Compared as Decimal in Python, not in SQL: the columns are TEXT holding the
+    vendor's exact decimal string, and TEXT compares lexically -- "9" would beat
+    "10". Same reason percentiles are computed in Python (dialect.py).
+
+    Called on EVERY observation, not only at horizons, and still only a LOWER
+    BOUND on the true peak. We sample; we do not stream.
+    """
+    row = await db.fetchrow(
+        "select max_price_usd_seen, max_liquidity_usd_seen, observations "
+        "from mint_peaks where mint = ?", mint,
+    )
+    if row is None:
+        await db.execute(
+            "insert into mint_peaks (mint, max_price_usd_seen, max_liquidity_usd_seen, "
+            " observations, first_observed_at, last_observed_at) "
+            "values (?, ?, ?, ?, ?, ?) on conflict (mint) do nothing",
+            mint, price_usd or "0", liquidity_usd, 1, observed_at, observed_at,
+        )
+        return
+    await db.execute(
+        "update mint_peaks set max_price_usd_seen = ?, max_liquidity_usd_seen = ?, "
+        "observations = observations + 1, last_observed_at = ? where mint = ?",
+        _max_decimal(row["max_price_usd_seen"], price_usd) or "0",
+        _max_decimal(row["max_liquidity_usd_seen"], liquidity_usd),
+        observed_at, mint,
+    )
+
+
+def _max_decimal(current: str | None, candidate: str | None) -> str | None:
+    """Larger of two decimal strings, preserving the original text."""
+    if candidate is None:
+        return current
+    if current is None:
+        return candidate
+    try:
+        return candidate if Decimal(candidate) > Decimal(current) else current
+    except (InvalidOperation, ValueError):
+        return current
+
+
+async def outcome_coverage(db: Database, horizons: tuple[str, ...]) -> dict:
+    """Rows per horizon, status split, and how many are due but unobserved."""
+    rows = await db.fetch(
+        "select horizon, status, backfilled, venue_kind, count(*) as n from outcomes "
+        "group by horizon, status, backfilled, venue_kind"
+    )
+    total_tokens = await db.fetchval("select count(*) from tokens_seen") or 0
+    out: dict[str, Any] = {"total_tokens": total_tokens, "horizons": {}}
+    for h in horizons:
+        out["horizons"][h] = {
+            "observed": 0, "backfilled": 0, "status": {}, "venue": {}, "due_unobserved": 0,
+        }
+    for r in rows:
+        bucket = out["horizons"].setdefault(
+            r["horizon"],
+            {"observed": 0, "backfilled": 0, "status": {}, "venue": {}, "due_unobserved": 0},
+        )
+        bucket["observed"] += r["n"]
+        if r["backfilled"]:
+            bucket["backfilled"] += r["n"]
+        bucket["status"][r["status"]] = bucket["status"].get(r["status"], 0) + r["n"]
+        venue = r["venue_kind"] or "none"
+        bucket["venue"][venue] = bucket["venue"].get(venue, 0) + r["n"]
+    return out
+
+
+async def due_count(db: Database, horizon: str, horizon_seconds: int) -> int:
+    cutoff = iso(_now() - dt.timedelta(seconds=horizon_seconds))
+    return await db.fetchval(
+        "select count(*) from tokens_seen t "
+        "left join outcomes o on o.mint = t.mint and o.horizon = ? "
+        "where t.detected_at <= ? and o.mint is null",
+        horizon, cutoff,
+    ) or 0
+
+
+async def outcomes_for_mint(db: Database, mint: str) -> list[dict]:
+    return await db.fetch(
+        "select horizon, scheduled_for, observed_at, lateness_seconds, status, "
+        "ambiguous_no_pool, backfilled, source, price_usd, liquidity_usd, fdv_usd, "
+        "market_cap_usd, txns_h24_buys, txns_h24_sells, pair_created_at, dex_id, "
+        "venue_kind, market_type, error "
+        "from outcomes where mint = ? order by scheduled_for",
+        mint,
+    )
+
+
+async def peak_for_mint(db: Database, mint: str) -> dict | None:
+    return await db.fetchrow("select * from mint_peaks where mint = ?", mint)
+
+
+async def rule_evaluation_rows(db: Database, *, limit: int = 200_000) -> list[dict]:
+    """Every mint joined to its outcomes and peak, flattened one row per mint.
+
+    Deliberately returns raw columns rather than a verdict. Rules are Python
+    predicates over these dicts (label/rules.py) so a new rule is a function,
+    not a new query.
+    """
+    return await db.fetch(
+        "select t.mint, t.signer, t.declared_creator, t.launchpad, t.symbol, "
+        "       t.detected_at, t.is_mayhem_mode, t.initial_buy_base, "
+        "       t.virtual_sol_reserves, t.token_total_supply, "
+        "       c.n_mints as creator_n_mints, "
+        "       p.max_price_usd_seen, p.observations as peak_observations, "
+        "       o24.venue_kind as venue_24h, o7.venue_kind as venue_7d, "
+        "       o15.venue_kind as venue_15m, "
+        "       o15.status as status_15m, o15.price_usd as price_15m, "
+        "       o15.liquidity_usd as liquidity_15m, o15.lateness_seconds as lateness_15m, "
+        "       o15.backfilled as backfilled_15m, o15.ambiguous_no_pool as ambiguous_15m, "
+        "       o24.status as status_24h, o24.price_usd as price_24h, "
+        "       o24.liquidity_usd as liquidity_24h, o24.lateness_seconds as lateness_24h, "
+        "       o24.backfilled as backfilled_24h, "
+        "       o7.status as status_7d, o7.liquidity_usd as liquidity_7d "
+        "from tokens_seen t "
+        "left join mint_peaks p on p.mint = t.mint "
+        "left join creators c on c.address = t.signer and c.role = 'signer' "
+        "left join outcomes o15 on o15.mint = t.mint and o15.horizon = '15m' "
+        "left join outcomes o24 on o24.mint = t.mint and o24.horizon = '24h' "
+        "left join outcomes o7  on o7.mint  = t.mint and o7.horizon  = '7d' "
+        "order by t.detected_at desc limit ?",
+        limit,
+    )
