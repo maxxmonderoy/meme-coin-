@@ -128,6 +128,37 @@ endpoints, because the case that gets an IP banned is the backlog burst after an
 outage, not the steady state. Batch size is 25, set below the 30 whose
 correctness was verified by a union test on 2026-08-30.
 
+## The week-1 gate, reformulated
+
+The original gate was seven consecutive days of stream coverage. Measured on a
+shared machine it scored the wrong thing: **22 of 22 stream stops were
+`clean shutdown`** -- a SIGTERM from a logout or a reboot -- and not one was a
+crash, stall, or unhandled error. Counting consecutive hours reported 0.6%
+while nothing in the software had failed in five days.
+
+So the gate now asks the question the soak was for:
+
+```bash
+trenches gate --days 7 -v
+```
+
+> Over the window, **zero gaps attributable to the system**. A gap is forgiven
+> only when the preceding session recorded a clean shutdown. Anything else --
+> including a session that simply vanished with no stop reason -- counts against
+> the system, because an unexplained gap is exactly where a crash would hide.
+> All health counters at zero.
+
+**This is a weaker claim than the original and the README says so out loud.**
+It certifies that nothing we wrote broke. It does not certify that the process
+stays up unattended for a week, which is a property of the host, and which
+becomes nearly free to demonstrate on a machine with no lid to close.
+
+Passive uptime is replaced by **fault injection** (`tests/test_chaos.py`): the
+socket is killed mid-stream, the feed is made silently idle so only the
+watchdog can catch it, a live feed sends a clean EOF, four failures fire in a
+row to test bounded backoff, and events are replayed to prove dedupe. A soak
+says "nothing went wrong"; this says "we made it go wrong and nothing was lost".
+
 ## Storage
 
 SQLite with WAL. Amounts are stored as exact-integer **TEXT**, not INTEGER:

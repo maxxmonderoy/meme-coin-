@@ -547,6 +547,58 @@ async def cmd_rules_report(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_gate(cfg: Config, args: argparse.Namespace) -> int:
+    """Week-1 gate, attributed.
+
+    The original formulation counted consecutive stream hours, which scores
+    "somebody logged the machine out" and "the collector crashed" as the same
+    number. On a shared machine that measures the household, not the software.
+    This asks the question the soak was actually for: did anything break that
+    was OURS?
+    """
+    db = await pool_mod.connect(cfg.dsn)
+    try:
+        report = await repo.gap_attribution(db, days=args.days)
+        counters = await db.fetchrow(
+            "select coalesce(sum(decode_failures),0) as decode_failures, "
+            "coalesce(sum(schema_mismatches),0) as schema_mismatches, "
+            "coalesce(sum(queue_drops),0) as queue_drops, "
+            "coalesce(sum(stale_responses),0) as stale_responses, "
+            "coalesce(sum(reconnects),0) as reconnects from feed_health"
+        )
+    finally:
+        await db.close()
+
+    print(f"window: last {args.days:g} days   sessions: {report['sessions']}")
+    print(f"  gaps attributed to the HOST   {report['host_caused']:>4}   "
+          f"(clean shutdown -- logout, reboot, someone else using the machine)")
+    print(f"  gaps attributed to the SYSTEM {report['system_caused']:>4}   "
+          f"(crash, stall, or unexplained -- these are ours)")
+    print()
+    for name in ("decode_failures", "schema_mismatches", "queue_drops", "stale_responses"):
+        print(f"  {name:<18} {int(counters[name]):>6,}")
+    print(f"  {'reconnects':<18} {int(counters['reconnects']):>6,}   (recovered, not failures)")
+
+    if args.verbose and report["gaps"]:
+        print("\n  every gap:")
+        for g in report["gaps"][-25:]:
+            secs = "unknown" if g["seconds"] is None else f"{g['seconds'] // 60}m"
+            print(f"    after stream #{g['after_stream']:<4} {g['attributed']:<7} "
+                  f"{secs:>9}  {g['reason'][:60]}")
+
+    broken = (report["system_caused"] + int(counters["decode_failures"])
+              + int(counters["schema_mismatches"]) + int(counters["queue_drops"])
+              + int(counters["stale_responses"]))
+    print()
+    if broken == 0:
+        print(f"VERDICT: CLEAN over {args.days:g} days -- no failure attributable to this system.")
+        print("  This is NOT the same claim as 'ran unattended for seven days'. It says")
+        print("  nothing we wrote broke; it says nothing about whether the host stays up.")
+    else:
+        print(f"VERDICT: {broken} system-attributable failure(s). Run with -v for the list.")
+    return 0 if broken == 0 else 1
+
+
 # -- entry point -----------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -590,6 +642,10 @@ def build_parser() -> argparse.ArgumentParser:
                             help="check recorded PumpPortal frames against the declared schema")
     verify.add_argument("path")
 
+    gate = sub.add_parser("gate", help="week-1 gate: gaps attributed to host vs system")
+    gate.add_argument("--days", type=float, default=7)
+    gate.add_argument("-v", "--verbose", action="store_true", help="list every gap")
+
     sub.add_parser("idl-check", help="diff the vendored IDL against upstream")
     sub.add_parser("prune", help="delete raw_events past the retention window")
     return parser
@@ -599,7 +655,7 @@ HANDLERS = {
     "migrate": cmd_migrate, "stream": cmd_stream, "stats": cmd_stats,
     "inspect": cmd_inspect, "verify-capture": cmd_verify_capture,
     "idl-check": cmd_idl_check, "prune": cmd_prune,
-    "label": cmd_label, "rules-report": cmd_rules_report,
+    "label": cmd_label, "rules-report": cmd_rules_report, "gate": cmd_gate,
 }
 
 

@@ -7,11 +7,12 @@ no dialect-specific casts. Time cutoffs and percentiles are computed in Python.
 from __future__ import annotations
 
 import datetime as dt
+import itertools
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from ..stream.base import RawEvent
-from .dialect import Database, base_units, dumps, iso, loads, percentiles
+from .dialect import Database, base_units, dumps, iso, loads, parse_ts, percentiles
 
 
 def _now() -> dt.datetime:
@@ -507,3 +508,56 @@ async def rule_evaluation_rows(db: Database, *, limit: int = 200_000) -> list[di
         "order by t.detected_at desc limit ?",
         limit,
     )
+
+
+# -- gate attribution ------------------------------------------------------
+
+async def gap_attribution(db: Database, days: float = 7) -> dict:
+    """Every gap between stream sessions, attributed to the host or the system.
+
+    THE POINT. The original week-1 gate counted consecutive hours, which scores
+    "the laptop got logged out" and "the collector crashed" as the same number.
+    They are not the same: one is somebody else using the machine, the other is
+    a bug. This separates them.
+
+    A gap is forgiven ONLY when the preceding session recorded a clean shutdown
+    -- i.e. the process was signalled. Anything else, including a session that
+    simply vanished with no stop reason at all, counts against the system. An
+    unexplained gap must never get the benefit of the doubt, because that is
+    exactly where a crash would hide.
+    """
+    cutoff = iso(_now() - dt.timedelta(days=days))
+    rows = await db.fetch(
+        "select id, started_at, stopped_at, stop_reason from streams "
+        "where started_at >= ? order by started_at",
+        cutoff,
+    )
+    gaps: list[dict] = []
+    host = system = 0
+    for prev, nxt in itertools.pairwise(rows):
+        started = parse_ts(nxt["started_at"])
+        stopped = parse_ts(prev["stopped_at"])
+        reason = prev["stop_reason"]
+        if stopped is None:
+            # Vanished: no stopped_at was ever written, so nothing signalled it.
+            seconds = None
+            attributed = "system"
+            reason = reason or "vanished (no stopped_at recorded)"
+        else:
+            seconds = max(0, int((started - stopped).total_seconds()))
+            attributed = "host" if reason == "clean shutdown" else "system"
+        if attributed == "host":
+            host += 1
+        else:
+            system += 1
+        gaps.append({
+            "after_stream": prev["id"], "seconds": seconds,
+            "reason": reason or "(none recorded)", "attributed": attributed,
+        })
+    return {
+        "window_days": days,
+        "sessions": len(rows),
+        "gaps": gaps,
+        "host_caused": host,
+        "system_caused": system,
+    }
