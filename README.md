@@ -189,6 +189,43 @@ report rather than hide.** Two reasons, both stated in the command's own output:
 A cascade that accepts everything is not a filter. It is a filter with no data,
 and the difference is worth keeping visible.
 
+## Derived rug labels
+
+```bash
+trenches rugs --dry-run     # see what it would label
+trenches rugs               # fill creators.n_rugged
+```
+
+Stage 2 needs `n_rugged` and nothing was writing it. Rather than reach for
+SolRPDS -- a fine dataset, but a fixed historical one that cannot label the
+tokens launching this week -- these labels come from outcomes we already
+collected.
+
+**It measures liquidity COLLAPSE, not proven malice**, and the code says so in
+every docstring. A token that had real DEX liquidity and then had effectively
+none is what a price-and-liquidity snapshot can show; whether the deployer
+pulled it, a whale left, or demand evaporated is not visible. Stage 2 rejects a
+wallet on this number, so a false rug is a person filtered out for launching
+during a bad week.
+
+Three things it refuses to count, each with a test:
+
+- **A bonding curve going quiet.** ~95% of launches never graduate. Counting
+  those would call nearly every creator a rugger.
+- **A gentle decline.** Drifting down is not a pull; the collapse fraction is
+  what separates "went to zero" from "got quieter".
+- **A single observation.** One snapshot cannot show a transition.
+
+**It undercounts, and that is structural.** Median rugged lifespan is ~14
+minutes (1.2) and the first observation is at 15m, so the fastest rugs -- the
+most common kind -- are invisible here and look identical to a token that never
+had a pool. Never read a derived rug rate as the true rate.
+
+First run: **100 collapses across 59 signers** out of 99,993 mints examined, and
+**0 creators** clear stage 2's `>=3 mints AND >=60% rug rate`. That is the
+honest state of a five-day-old dataset with no 7d horizons due yet, not a
+finding about the market.
+
 ## Storage
 
 SQLite with WAL. Amounts are stored as exact-integer **TEXT**, not INTEGER:

@@ -662,6 +662,96 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_rugs(cfg: Config, args: argparse.Namespace) -> int:
+    """Derive rug labels from collected outcomes and fill creators.n_rugged.
+
+    Measures LIQUIDITY COLLAPSE, not proven malice -- see label/rugs.py. The
+    distinction is not pedantry: stage 2 rejects a wallet on this number, and a
+    confident label on a guess is how a filter ends up rejecting people for
+    having launched during a downturn.
+    """
+    from .db.dialect import parse_ts
+    from .label.rugs import Collapse, find_collapse, summarise
+
+    db = await pool_mod.connect(cfg.dsn)
+    try:
+        by_mint = await repo.observations_by_mint(db)
+        hits: list[tuple[str, str, str, float, float]] = []
+        for mint, observations in by_mint.items():
+            if len(observations) < 2:
+                continue
+            found = find_collapse(
+                observations,
+                liquidity_floor=args.liquidity_floor,
+                collapse_fraction=args.collapse_fraction,
+            )
+            if found:
+                hits.append((mint, *found))
+
+        identity = await repo.mint_identity(db, [h[0] for h in hits])
+        collapses: list[Collapse] = []
+        for mint, from_h, to_h, peak, final in hits:
+            ident = identity.get(mint) or {}
+            observations = by_mint[mint]
+            collapsed_at = next(
+                (o["scheduled_for"] for o in observations if o["horizon"] == to_h), None
+            )
+            born = parse_ts(ident.get("detected_at"))
+            died = parse_ts(collapsed_at)
+            lifetime = int((died - born).total_seconds()) if born and died else None
+            collapses.append(Collapse(
+                mint=mint, signer=ident.get("signer"), peak_liquidity_usd=peak,
+                final_liquidity_usd=final, first_seen_at=str(ident.get("detected_at")),
+                collapsed_at=str(collapsed_at), lifetime_seconds=lifetime,
+                from_horizon=from_h, to_horizon=to_h,
+            ))
+
+        counts: dict[str, int] = {}
+        lifetimes: dict[str, list[int]] = {}
+        for c in collapses:
+            if not c.signer:
+                continue
+            counts[c.signer] = counts.get(c.signer, 0) + 1
+            if c.lifetime_seconds is not None:
+                lifetimes.setdefault(c.signer, []).append(c.lifetime_seconds)
+
+        if not args.dry_run:
+            await repo.reset_derived_rugs(db)
+            updated = await repo.apply_rug_counts(db, counts)
+            await repo.apply_median_lifetimes(
+                db, {a: sorted(v)[len(v) // 2] for a, v in lifetimes.items()}
+            )
+        else:
+            updated = 0
+
+        stats = summarise(collapses)
+        at_risk = await repo.creators_at_risk(
+            db, min_mints=cfg.decide_creator_min_mints,
+            max_rug_rate=cfg.decide_creator_max_rug_rate,
+        )
+    finally:
+        await db.close()
+
+    print(f"mints examined        {len(by_mint):,}")
+    suffix = ("   (DRY RUN, nothing written)" if args.dry_run
+              else f"   -> {updated:,} creators updated")
+    print(f"liquidity collapses   {stats['collapses']:,}{suffix}")
+    print(f"distinct signers      {stats['distinct_signers']:,}")
+    if stats["median_lifetime_seconds"] is not None:
+        print(f"median lifetime       {stats['median_lifetime_seconds'] // 60:,} min")
+    print(f"\ncreators stage 2 would now reject "
+          f"(>= {cfg.decide_creator_min_mints} mints, rug rate >= "
+          f"{cfg.decide_creator_max_rug_rate:.0%}): {len(at_risk):,}")
+    for r in at_risk[:10]:
+        print(f"  {r['address'][:16]}..  {r['n_rugged']}/{r['n_mints']} = {r['rug_rate']:.0%}")
+
+    print("\n  This measures liquidity COLLAPSE, not proven malice, and it")
+    print("  UNDERCOUNTS: median rugged lifespan is ~14 min (1.2) and the first")
+    print("  observation is at 15m, so the fastest rugs are invisible here and")
+    print("  look identical to a token that never had a pool.")
+    return 0
+
+
 # -- entry point -----------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -708,6 +798,11 @@ def build_parser() -> argparse.ArgumentParser:
     decide = sub.add_parser("decide", help="run the cascade over candidates (PAPER only)")
     decide.add_argument("--limit", type=int, default=5000)
 
+    rugs = sub.add_parser("rugs", help="derive rug labels from outcomes into creators.n_rugged")
+    rugs.add_argument("--liquidity-floor", type=float, default=1000.0)
+    rugs.add_argument("--collapse-fraction", type=float, default=0.1)
+    rugs.add_argument("--dry-run", action="store_true")
+
     gate = sub.add_parser("gate", help="week-1 gate: gaps attributed to host vs system")
     gate.add_argument("--days", type=float, default=7)
     gate.add_argument("-v", "--verbose", action="store_true", help="list every gap")
@@ -722,7 +817,7 @@ HANDLERS = {
     "inspect": cmd_inspect, "verify-capture": cmd_verify_capture,
     "idl-check": cmd_idl_check, "prune": cmd_prune,
     "label": cmd_label, "rules-report": cmd_rules_report, "gate": cmd_gate,
-    "decide": cmd_decide,
+    "decide": cmd_decide, "rugs": cmd_rugs,
 }
 
 

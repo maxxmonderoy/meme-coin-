@@ -620,3 +620,88 @@ async def decision_summary(db: Database) -> dict:
                 out["by_stage"].get(int(r["reject_stage"]), 0) + r["n"]
             )
     return out
+
+
+# -- derived rug labels ----------------------------------------------------
+
+async def observations_by_mint(db: Database, *, limit: int = 500_000) -> dict:
+    """Every mint's outcomes in scheduled order, for collapse detection."""
+    rows = await db.fetch(
+        "select mint, horizon, scheduled_for, status, venue_kind, liquidity_usd "
+        "from outcomes order by mint, scheduled_for limit ?",
+        limit,
+    )
+    out: dict[str, list[dict]] = {}
+    for r in rows:
+        out.setdefault(r["mint"], []).append(r)
+    return out
+
+
+async def mint_identity(db: Database, mints: list[str]) -> dict:
+    """signer + detected_at for a set of mints, in one pass."""
+    if not mints:
+        return {}
+    out: dict[str, dict] = {}
+    chunk = 500
+    for i in range(0, len(mints), chunk):
+        part = mints[i:i + chunk]
+        # The interpolated text is a run of "?" characters generated from the
+        # chunk length -- no value from `part` reaches the SQL string, every
+        # mint is a bound parameter. A fixed-arity IN clause is the only way to
+        # bind a variable-length list portably across both dialects.
+        placeholders = ",".join("?" for _ in part)
+        rows = await db.fetch(
+            f"select mint, signer, detected_at from tokens_seen "  # noqa: S608
+            f"where mint in ({placeholders})",
+            *part,
+        )
+        for r in rows:
+            out[r["mint"]] = r
+    return out
+
+
+async def reset_derived_rugs(db: Database) -> None:
+    """Recompute from scratch. Derivation is idempotent by construction.
+
+    Incrementing in place would double-count on a re-run, and a rug rate that
+    creeps upward every time the job runs is exactly the kind of number that
+    looks like a finding.
+    """
+    await db.execute("update creators set n_rugged = 0")
+
+
+async def apply_rug_counts(db: Database, counts: dict[str, int]) -> int:
+    """Write n_rugged per signer. Returns rows updated."""
+    updated = 0
+    for address, n in counts.items():
+        status = await db.execute(
+            "update creators set n_rugged = ? where address = ? and role = ?",
+            n, address, "signer",
+        )
+        if not status.endswith(" 0"):
+            updated += 1
+    return updated
+
+
+async def apply_median_lifetimes(db: Database, lifetimes: dict[str, int]) -> None:
+    for address, seconds in lifetimes.items():
+        await db.execute(
+            "update creators set median_lifetime_s = ? where address = ? and role = ?",
+            seconds, address, "signer",
+        )
+
+
+async def creators_at_risk(db: Database, *, min_mints: int, max_rug_rate: float) -> list[dict]:
+    """Creators stage 2 would now reject. Computed in Python, not SQL, because
+    rug_rate is derived at read time and never stored (001_init)."""
+    rows = await db.fetch(
+        "select address, role, n_mints, n_rugged, median_lifetime_s from creators "
+        "where n_rugged > 0 order by n_rugged desc"
+    )
+    out = []
+    for r in rows:
+        if r["n_mints"] and r["n_mints"] >= min_mints:
+            rate = r["n_rugged"] / r["n_mints"]
+            if rate >= max_rug_rate:
+                out.append({**r, "rug_rate": round(rate, 4)})
+    return out
