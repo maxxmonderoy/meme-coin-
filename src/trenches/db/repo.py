@@ -561,3 +561,62 @@ async def gap_attribution(db: Database, days: float = 7) -> dict:
         "host_caused": host,
         "system_caused": system,
     }
+
+
+# -- decisions -------------------------------------------------------------
+
+async def candidates_for_decision(db: Database, *, limit: int = 5000) -> list[dict]:
+    """Candidates with no decision row yet, joined to what stages 0-2 need.
+
+    Creator counts come from the local cache (3.4 stage 2), so this is one
+    query and no network call. Structural facts are NOT joined: nothing has
+    fetched them, and stage 1 reports `unfetched` rather than implying a pass.
+    """
+    return await db.fetch(
+        "select t.mint, t.signer, t.declared_creator, t.launchpad, t.symbol, "
+        "       t.is_mayhem_mode, t.stream_id, "
+        "       c.n_mints as creator_n_mints, c.n_rugged as creator_n_rugged "
+        "from tokens_seen t "
+        "left join creators c on c.address = t.signer and c.role = 'signer' "
+        "left join decisions d on d.mint = t.mint "
+        "where d.mint is null "
+        "order by t.detected_at desc limit ?",
+        limit,
+    )
+
+
+async def record_decision(db: Database, *, mint: str, fields: dict) -> None:
+    """Journal one verdict, accept or reject, with the inputs behind it.
+
+    3.9.3: rejections are recorded, never dropped -- a rejection that later 10x'd
+    is training data and rules-report is built to find exactly those. `mode` is
+    a column, not a fork in the code (3.9.1).
+    """
+    await db.execute(
+        "insert into decisions "
+        "(mint, stream_id, decided_at, mode, outcome, reject_stage, reject_reason, "
+        " inputs, cascade_ms, decision_latency_ms, thresholds, code_version) "
+        "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        mint, fields.get("stream_id"), iso(_now()), fields.get("mode", "PAPER"),
+        fields["outcome"], fields.get("reject_stage"), fields.get("reject_reason"),
+        dumps(fields.get("inputs")), dumps(fields.get("cascade_ms")),
+        fields.get("decision_latency_ms"), dumps(fields["thresholds"]),
+        fields["code_version"],
+    )
+
+
+async def decision_summary(db: Database) -> dict:
+    """Accept/reject split and which stage did the rejecting."""
+    rows = await db.fetch(
+        "select outcome, reject_stage, count(*) as n from decisions "
+        "group by outcome, reject_stage"
+    )
+    out = {"total": 0, "accept": 0, "reject": 0, "by_stage": {}}
+    for r in rows:
+        out["total"] += r["n"]
+        out[r["outcome"]] = out.get(r["outcome"], 0) + r["n"]
+        if r["reject_stage"] is not None:
+            out["by_stage"][int(r["reject_stage"])] = (
+                out["by_stage"].get(int(r["reject_stage"]), 0) + r["n"]
+            )
+    return out

@@ -599,6 +599,69 @@ async def cmd_gate(cfg: Config, args: argparse.Namespace) -> int:
     return 0 if broken == 0 else 1
 
 
+async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
+    """Run the 3.4 cascade over candidates and journal every verdict. PAPER only.
+
+    There is no execute path and nothing here can sign. `mode` is a column
+    (3.9.1), so the day live becomes possible this same code runs with a
+    different value in that column rather than a different branch.
+    """
+    import time
+
+    from .decide import Cascade
+
+    cascade = Cascade(
+        min_mints=cfg.decide_creator_min_mints,
+        max_rug_rate=cfg.decide_creator_max_rug_rate,
+    )
+    thresholds = cascade.thresholds()
+    version = code_version()
+
+    db = await pool_mod.connect(cfg.dsn)
+    try:
+        rows = await repo.candidates_for_decision(db, limit=args.limit)
+        if not rows:
+            print("no undecided candidates")
+            return 0
+        accepted = rejected = 0
+        for row in rows:
+            started = time.perf_counter()
+            verdict, trail = cascade.run(dict(row))
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            await repo.record_decision(db, mint=row["mint"], fields={
+                "stream_id": row.get("stream_id"),
+                "mode": "PAPER",
+                "outcome": "reject" if verdict.rejected else "accept",
+                "reject_stage": verdict.stage if verdict.rejected else None,
+                "reject_reason": verdict.reason if verdict.rejected else None,
+                "inputs": {f"stage{v.stage}": v.inputs for v in trail},
+                "cascade_ms": {f"stage{v.stage}": elapsed_ms for v in trail},
+                "decision_latency_ms": elapsed_ms,
+                "thresholds": thresholds,
+                "code_version": version,
+            })
+            if verdict.rejected:
+                rejected += 1
+            else:
+                accepted += 1
+        summary = await repo.decision_summary(db)
+    finally:
+        await db.close()
+
+    print(f"decided {len(rows):,}  accept={accepted:,}  reject={rejected:,}")
+    print(f"\njournal now holds {summary['total']:,} decisions "
+          f"({summary['accept']:,} accept / {summary['reject']:,} reject)")
+    if summary["by_stage"]:
+        print("  rejections by stage:")
+        for stage, n in sorted(summary["by_stage"].items()):
+            print(f"    stage {stage}: {n:,}")
+    if accepted == len(rows):
+        print("\n  NOTE every candidate was accepted. Stage 1 has no structural facts to")
+        print("  read (nothing fetches them yet) and stage 2 cannot fire because n_rugged")
+        print("  is zero everywhere -- nothing labels rugs. That is unlabelled, not clean.")
+    return 0
+
+
 # -- entry point -----------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -642,6 +705,9 @@ def build_parser() -> argparse.ArgumentParser:
                             help="check recorded PumpPortal frames against the declared schema")
     verify.add_argument("path")
 
+    decide = sub.add_parser("decide", help="run the cascade over candidates (PAPER only)")
+    decide.add_argument("--limit", type=int, default=5000)
+
     gate = sub.add_parser("gate", help="week-1 gate: gaps attributed to host vs system")
     gate.add_argument("--days", type=float, default=7)
     gate.add_argument("-v", "--verbose", action="store_true", help="list every gap")
@@ -656,6 +722,7 @@ HANDLERS = {
     "inspect": cmd_inspect, "verify-capture": cmd_verify_capture,
     "idl-check": cmd_idl_check, "prune": cmd_prune,
     "label": cmd_label, "rules-report": cmd_rules_report, "gate": cmd_gate,
+    "decide": cmd_decide,
 }
 
 

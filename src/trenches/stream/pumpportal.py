@@ -392,5 +392,31 @@ def token_fields(frame: dict) -> dict:
         "pool": frame.get("pool"),
         "initial_buy_base": _as_int(frame.get("initialBuy")),
         "virtual_token_reserves": _as_int(frame.get("vTokensInBondingCurve")),
+        # Present in 65 of 67 captured frames and previously dropped on the
+        # floor, which is why the `mayhem_mode` rule in label/rules.py has
+        # never once fired -- it reads a column nothing wrote.
+        "is_mayhem_mode": (
+            None if frame.get("is_mayhem_mode") is None
+            else int(bool(frame["is_mayhem_mode"]))
+        ),
         "signature": frame.get("signature"),
     }
+
+
+# DELIBERATELY NOT MAPPED, and this is not an oversight:
+#
+#   vSolInBondingCurve -> virtual_sol_reserves
+#     The frame reports 30, and pump.fun's initial virtual reserve is 30 SOL --
+#     so the field is DENOMINATED IN SOL, not lamports. Writing 30 into a
+#     base-units column would be wrong by 1e9. It also goes fractional after
+#     any trade, and _as_int correctly refuses a float in an amount path
+#     (3.10). Mapping it needs a decided unit convention, not a one-liner.
+#
+#   marketCapSol
+#     A float, and there is no column for it. Storing it as an amount would
+#     put a float in the money path.
+#
+# initial_buy_base has the same shape of problem and is why it is only ~11%
+# populated: pump frames send an integer, bonk frames send 999999999.990125,
+# and converting tokens to base units exactly needs `decimals`, which this
+# feed does not carry. A null is honest; a rounded integer would not be.

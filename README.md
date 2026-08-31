@@ -159,6 +159,36 @@ watchdog can catch it, a live feed sends a clean EOF, four failures fire in a
 row to test bounded backoff, and events are replayed to prove dedupe. A soak
 says "nothing went wrong"; this says "we made it go wrong and nothing was lost".
 
+## Week 2: the cascade, stages 0-2 (paper only)
+
+```bash
+trenches decide --limit 5000     # journal a verdict for every candidate
+```
+
+Nothing in `decide/` can construct or sign a transaction, and there is no
+`execute()`. `mode` is a column on `decisions`, never a branch in the code
+(3.9.1) -- a decide path that forks on mode is one that was never really tested.
+
+Every stage is a pure `facts -> Verdict`. Nothing fetches, which keeps 3.4's
+cost ordering an explicit caller decision rather than a network call hidden
+inside a predicate, and makes the whole cascade testable offline.
+
+**The first run accepted 5,000 of 5,000, and that is the correct result to
+report rather than hide.** Two reasons, both stated in the command's own output:
+
+- **Stage 1 has nothing to read.** Mint/freeze/close authority, the Token-2022
+  upgradable flags, transfer hooks and fees are all knowable within ~1s of a
+  launch (Part 2), but nothing fetches them yet. The stage records
+  `structural: unfetched` rather than implying a pass, because **absence is not
+  a clean bill of health** -- reading empty as clean is named in Part 2 as the
+  single most expensive mistake available here.
+- **Stage 2 cannot fire.** `rug_rate` needs `n_rugged`, and nothing labels rugs,
+  so all 28,766 creators read 0.0 -- including the one with 372 launches. The
+  rule is wired and journalled so it starts working the day labelling lands.
+
+A cascade that accepts everything is not a filter. It is a filter with no data,
+and the difference is worth keeping visible.
+
 ## Storage
 
 SQLite with WAL. Amounts are stored as exact-integer **TEXT**, not INTEGER:

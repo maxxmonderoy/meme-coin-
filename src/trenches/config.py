@@ -89,6 +89,8 @@ class Config:
     label_fallback_budget: int
     label_dead_liquidity_usd: float
     label_peak_multiple: float
+    decide_creator_min_mints: int
+    decide_creator_max_rug_rate: float
     log_level: str = field(default="INFO")
 
     @staticmethod
@@ -146,6 +148,8 @@ class Config:
             label_fallback_budget=_get_int("TRENCHES_LABEL_FALLBACK_BUDGET", 100),
             label_dead_liquidity_usd=_get_float("TRENCHES_LABEL_DEAD_LIQUIDITY_USD", 1000.0),
             label_peak_multiple=_get_float("TRENCHES_LABEL_PEAK_MULTIPLE", 2.0),
+            decide_creator_min_mints=_get_int("TRENCHES_DECIDE_CREATOR_MIN_MINTS", 3),
+            decide_creator_max_rug_rate=_get_float("TRENCHES_DECIDE_CREATOR_MAX_RUG_RATE", 0.6),
             log_level=_get("TRENCHES_LOG_LEVEL", "INFO"),
         )
         if cfg.workers < 1:
