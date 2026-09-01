@@ -436,3 +436,191 @@ async def test_coverage_counts_asked_separately_from_answered(any_db):
     assert cov["probed"] == 2        # asked twice
     assert cov["with_fields"] == 1   # answered once
     assert cov["would_reject"] == 1
+
+
+# -- the live wiring -------------------------------------------------------
+
+async def _ingest(db, **kw):
+    """An Ingest wired the way `trenches stream --paper` wires it.
+
+    Config comes from `from_env` rather than being hand-constructed: a literal
+    field list here goes stale every time Config gains a setting, and the
+    failure looks like a product bug rather than a stale test.
+    """
+    import os
+
+    from trenches.config import Config
+    from trenches.decide import Cascade
+    from trenches.paper.runner import PaperRunner
+    from trenches.pipeline.worker import Ingest
+
+    os.environ.setdefault("TRENCHES_DSN", "sqlite://:memory:")
+    os.environ.setdefault("TRENCHES_FEEDS", "pumpportal")
+    cfg = Config.from_env()
+    runner = PaperRunner(db, bankroll_sol=D("10"), size_pct=D("1"))
+    return Ingest(db, cfg, 1, paper=runner, cascade=Cascade()), runner
+
+
+async def test_a_trade_event_is_stored_as_a_tick(any_db):
+    """The live loop dropped trade frames entirely before this."""
+    from trenches.db import repo
+    from trenches.stream.base import EventKind, RawEvent
+
+    await repo.open_stream(any_db, feeds=["pumpportal"], subscription={}, code_version="v")
+    ingest, _ = await _ingest(any_db)
+    await ingest._handle_trade(RawEvent(
+        provider="pumpportal", event_kind=EventKind.TRADE, mint="MT", signature="TS1",
+        payload={"raw": {"solAmount": 1.5, "tokenAmount": 30000000,
+                         "traderPublicKey": "T", "pool": "pump"},
+                 "price_sol": "5E-8", "is_buy": True},
+    ))
+    rows = await repo.ticks_for_mint(any_db, "MT")
+    assert len(rows) == 1
+    assert rows[0]["price_sol"] == "5E-8"
+    assert rows[0]["pool"] == "pump"
+    assert ingest.ticks_stored == 1
+
+
+async def test_an_accepted_candidate_is_journalled_and_armed(any_db):
+    """Accept must reach the paper runner. Before this, `arm` was never called
+    anywhere outside the replay command."""
+    from trenches.db import repo
+
+    await repo.open_stream(any_db, feeds=["pumpportal"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="MA", stream_id=1, feed="pumpportal", fields={})
+    ingest, runner = await _ingest(any_db)
+
+    await ingest._decide("MA", {"signer": "S1"})
+    row = await any_db.fetchrow("select * from decisions where mint = ?", "MA")
+    assert row["outcome"] == "accept" and row["mode"] == "PAPER"
+    assert "MA" in runner.pending
+    assert ingest.armed == 1
+
+
+async def test_a_rejected_candidate_is_journalled_and_not_armed(any_db):
+    """3.9.3: rejections are recorded. And they must not open a position."""
+    from trenches.db import repo
+
+    await repo.open_stream(any_db, feeds=["pumpportal"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="MR", stream_id=1, feed="pumpportal", fields={})
+    await repo.record_structural(any_db, mint="MR", fields={
+        "source": "goplus", "fetched_at": T0, "freezable": True, "fields_present": 1})
+    ingest, runner = await _ingest(any_db)
+
+    await ingest._decide("MR", {"signer": "S1", "freezable": 1})
+    row = await any_db.fetchrow("select * from decisions where mint = ?", "MR")
+    assert row["outcome"] == "reject" and row["reject_stage"] == 1
+    assert "MR" not in runner.pending
+    assert ingest.armed == 0
+
+
+async def test_decisions_at_detection_record_structural_as_unfetched(any_db):
+    """At t=0 nothing has been fetched for a brand new mint, and the journal
+    must say so rather than imply a clean pass (Part 2)."""
+    from trenches.db import repo
+
+    await repo.open_stream(any_db, feeds=["pumpportal"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="MN", stream_id=1, feed="pumpportal", fields={})
+    ingest, _ = await _ingest(any_db)
+    await ingest._decide("MN", {"signer": "S1"})
+
+    row = await any_db.fetchrow("select inputs from decisions where mint = ?", "MN")
+    assert "unfetched" in row["inputs"]
+
+
+# -- the separate exit loop (3.1) -----------------------------------------
+
+async def test_exit_loop_rebuilds_a_position_from_the_journal(any_db):
+    """3.1 wants the exit loop in its own process, so state must come from rows
+    rather than from memory shared with the entry side."""
+    from trenches.db import repo
+    from trenches.paper import exits as exit_mod
+    from trenches.paper.runner import PaperRunner
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="MX", stream_id=1, feed="f", fields={})
+    runner = PaperRunner(any_db, bankroll_sol=D("10"), size_pct=D("1"))
+    runner.arm("MX")
+    await runner.on_tick("MX", tick(0, "0.000001"))
+    await repo.insert_trade_tick(any_db, mint="MX", signature="t0", fields={
+        "observed_at": T0, "price_sol": "0.000001"})
+    await repo.insert_trade_tick(any_db, mint="MX", signature="t1", fields={
+        "observed_at": T0 + dt.timedelta(seconds=10), "price_sol": "0.000002"})
+
+    row = await any_db.fetchrow("select * from paper_positions where mint = ?", "MX")
+    rebuilt = await exit_mod.rebuild(any_db, row)
+    assert rebuilt is not None
+    assert rebuilt.tokens_held > 0
+    assert rebuilt.peak_price == D("0.000002")     # recomputed from the tape
+
+
+async def test_exit_loop_closes_a_bag_the_entry_side_abandoned(any_db):
+    """The 3.1 failure: an entry-side crash leaves an open position. A second
+    process must be able to close it with no shared memory at all."""
+    from trenches.db import repo
+    from trenches.paper import exits as exit_mod
+    from trenches.paper.runner import PaperRunner
+    from trenches.paper.simulator import ExitPlan
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="MZ", stream_id=1, feed="f", fields={})
+    runner = PaperRunner(any_db, bankroll_sol=D("10"), size_pct=D("1"),
+                         plan=ExitPlan(timeout_seconds=60))
+    runner.arm("MZ")
+    await runner.on_tick("MZ", tick(0, "0.000001"))
+    del runner        # the entry side is gone; nothing is in memory
+
+    report = await exit_mod.sweep(any_db, now=T0 + dt.timedelta(seconds=300))
+    assert report["closed"] == 1
+    row = await any_db.fetchrow("select * from paper_positions where mint = ?", "MZ")
+    assert row["status"] == "closed" and row["exit_reason"] == "timeout"
+
+
+async def test_exit_loop_applies_ticks_the_entry_side_never_saw(any_db):
+    """Ticks that arrived while the entry side was down still move the ladder."""
+    from trenches.db import repo
+    from trenches.paper import exits as exit_mod
+    from trenches.paper.runner import PaperRunner
+    from trenches.paper.simulator import ExitPlan
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="MY", stream_id=1, feed="f", fields={})
+    runner = PaperRunner(any_db, bankroll_sol=D("10"), size_pct=D("1"),
+                         plan=ExitPlan(tp_multiple=D("99"), trail_pct=D("0.35"),
+                                       timeout_seconds=99999))
+    runner.arm("MY")
+    await runner.on_tick("MY", tick(0, "0.000001"))
+    del runner
+    # Peak then collapse, recorded only on the tape.
+    await repo.insert_trade_tick(any_db, mint="MY", signature="a", fields={
+        "observed_at": T0 + dt.timedelta(seconds=10), "price_sol": "0.000002"})
+    await repo.insert_trade_tick(any_db, mint="MY", signature="b", fields={
+        "observed_at": T0 + dt.timedelta(seconds=20), "price_sol": "0.0000011"})
+
+    report = await exit_mod.sweep(any_db, now=T0 + dt.timedelta(seconds=30))
+    assert report["closed"] == 1
+    row = await any_db.fetchrow("select * from paper_positions where mint = ?", "MY")
+    assert row["exit_reason"] == "trail"
+
+
+async def test_exit_loop_is_idempotent_across_runs(any_db):
+    """It runs on a timer; a second pass must not re-close or double-fill."""
+    from trenches.db import repo
+    from trenches.paper import exits as exit_mod
+    from trenches.paper.runner import PaperRunner
+    from trenches.paper.simulator import ExitPlan
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="MI", stream_id=1, feed="f", fields={})
+    runner = PaperRunner(any_db, bankroll_sol=D("10"), size_pct=D("1"),
+                         plan=ExitPlan(timeout_seconds=60))
+    runner.arm("MI")
+    await runner.on_tick("MI", tick(0, "0.000001"))
+    del runner
+
+    first = await exit_mod.sweep(any_db, now=T0 + dt.timedelta(seconds=300))
+    second = await exit_mod.sweep(any_db, now=T0 + dt.timedelta(seconds=600))
+    assert first["closed"] == 1
+    assert second["open"] == 0 and second["closed"] == 0
+    fills = await any_db.fetch("select kind from paper_fills")
+    assert sorted(f["kind"] for f in fills) == ["entry", "timeout"]

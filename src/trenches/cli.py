@@ -85,15 +85,61 @@ async def cmd_stream(cfg: Config, args: argparse.Namespace) -> int:
     logmod.kv(log, 20, "stream opened", stream_id=stream_id, feeds=list(factories),
               dialect=db.dialect, retention=cfg.retention, code_version=code_version())
 
-    ingest = Ingest(db, cfg, stream_id, recorder=recorder)
+    paper_runner = cascade = None
+    if args.paper:
+        from decimal import Decimal
+
+        from .decide import Cascade
+        from .paper.fees import FeeModel
+        from .paper.runner import PaperRunner
+        from .paper.simulator import ExitPlan
+
+        cascade = Cascade(min_mints=cfg.decide_creator_min_mints,
+                          max_rug_rate=cfg.decide_creator_max_rug_rate)
+        # The runner holds the PumpPortal consumer so opening a position
+        # subscribes to that mint's trades on the SHARED socket (3.2).
+        tracker = next(
+            (c for c in probes.values() if c.provider == "pumpportal"), None
+        )
+        paper_runner = PaperRunner(
+            db, bankroll_sol=Decimal(str(args.bankroll)),
+            size_pct=Decimal(str(args.size_pct)),
+            plan=ExitPlan(), model=FeeModel(), tracker=tracker,
+        )
+        if tracker is None:
+            log.warning(
+                "paper is on but PumpPortal is not among the feeds; positions will be "
+                "armed and never priced, because nothing subscribes to their trades"
+            )
+
+    ingest = Ingest(db, cfg, stream_id, recorder=recorder,
+                    paper=paper_runner, cascade=cascade)
     mux = FeedMultiplexer(
         factories, backoff_min=cfg.backoff_min_seconds, backoff_max=cfg.backoff_max_seconds,
         on_reconnect=lambda feed, n, reason: ingest.health.record_reconnect(feed),
     )
 
-    workers = [asyncio.create_task(ingest.worker(f"w{i}"), name=f"worker-{i}")
+    workers = [asyncio.create_task(ingest.worker(f"w{i}", i), name=f"worker-{i}")
                for i in range(cfg.workers)]
     flusher = asyncio.create_task(ingest.health_flusher(), name="health")
+
+    async def _safety_sweep() -> None:
+        """In-process backstop only.
+
+        3.1 wants the exit loop in its own process and `trenches exits` is that.
+        This exists so a single-process run does not leave bags open, and it is
+        deliberately NOT a substitute: if this process stalls, so does this
+        sweep, which is the whole failure 3.1 is describing.
+        """
+        while paper_runner is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(asyncio.sleep(30)), timeout=31)
+            except (TimeoutError, asyncio.CancelledError):
+                return
+            with contextlib.suppress(Exception):
+                await paper_runner.sweep_timeouts()
+
+    sweeper = asyncio.create_task(_safety_sweep(), name="safety-sweep")
     consume = asyncio.create_task(ingest.consume(mux.run()), name="consume")
 
     # The labeler runs as a SIBLING with its own database connection, never
@@ -132,11 +178,14 @@ async def cmd_stream(cfg: Config, args: argparse.Namespace) -> int:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await consume
         with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(ingest.queue.join(), timeout=10)
+            await asyncio.wait_for(ingest.join(), timeout=10)
         ingest.stop()
         for w in workers:
             w.cancel()
         flusher.cancel()
+        sweeper.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await sweeper
         if label_task is not None:
             label_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -150,7 +199,9 @@ async def cmd_stream(cfg: Config, args: argparse.Namespace) -> int:
         await repo.close_stream(db, stream_id, stop_reason)
         await db.close()
         logmod.kv(log, 20, "stream closed", stream_id=stream_id, reason=stop_reason,
-                  dropped=ingest.dropped, dedupe_hits=ingest.dedupe.hits)
+                  dropped=ingest.dropped, dedupe_hits=ingest.dedupe.hits,
+                  ticks_stored=ingest.ticks_stored, decisions=ingest.decisions_made,
+                  armed=ingest.armed)
     return 0
 
 
@@ -522,6 +573,35 @@ async def cmd_structural(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_exits(cfg: Config, args: argparse.Namespace) -> int:
+    """The exit loop, as its own process (3.1).
+
+    Reads open positions from the shared store, applies any ticks that arrived,
+    and closes whatever the plan says is over. Run this ALONGSIDE `trenches
+    stream`, not inside it: an entry-side crash or rate-limit stall leaving an
+    open bag unwatched is the most common way a homemade bot dies, and that only
+    stays true while both halves share a process.
+    """
+    from .paper import exits as exit_mod
+    from .paper.fees import FeeModel
+
+    db = await pool_mod.connect(cfg.dsn)
+    model = FeeModel().pessimistic() if args.pessimistic else FeeModel()
+    try:
+        while True:
+            report = await exit_mod.sweep(db, model=model)
+            if report["open"] or args.once:
+                print(f"open={report['open']} closed={report['closed']} "
+                      f"still_open={report['still_open']} unusable={report['unusable']}")
+            if args.once:
+                return 0
+            await asyncio.sleep(args.interval)
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        await db.close()
+
+
 async def cmd_idl_check(cfg: Config, args: argparse.Namespace) -> int:
     from .decode import idl, idl_check
 
@@ -888,6 +968,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     stream = sub.add_parser("stream", help="run the ingest loop across all configured feeds")
     stream.add_argument("--record", metavar="DIR", help="also write events to JSONL for replay")
+    stream.add_argument("--paper", action=argparse.BooleanOptionalAction, default=True,
+                        help="run the cascade and open paper positions (default on). "
+                             "--no-paper is week-1 ingest only.")
+    stream.add_argument("--bankroll", default="10", help="speculative bankroll in SOL")
+    stream.add_argument("--size-pct", default="1.0", dest="size_pct",
+                        help="percent of bankroll per position (1.9 hard cap: 2.0)")
     stream.add_argument("--label", action="store_true",
                         help="also run the outcome labeler, isolated from ingest")
 
@@ -943,6 +1029,12 @@ def build_parser() -> argparse.ArgumentParser:
         "structural", help="fetch stage-1 structural facts (free, keyless)")
     structural.add_argument("--limit", type=int, default=200)
 
+    exits = sub.add_parser(
+        "exits", help="run the exit loop as its own process (3.1) -- run alongside `stream`")
+    exits.add_argument("--interval", type=float, default=15.0)
+    exits.add_argument("--once", action="store_true")
+    exits.add_argument("--pessimistic", action="store_true")
+
     sub.add_parser("idl-check", help="diff the vendored IDL against upstream")
     sub.add_parser("prune", help="delete raw_events past the retention window")
     return parser
@@ -953,6 +1045,7 @@ HANDLERS = {
     "inspect": cmd_inspect, "verify-capture": cmd_verify_capture,
     "paper": cmd_paper,
     "structural": cmd_structural,
+    "exits": cmd_exits,
     "idl-check": cmd_idl_check, "prune": cmd_prune,
     "label": cmd_label, "rules-report": cmd_rules_report, "gate": cmd_gate,
     "decide": cmd_decide, "rugs": cmd_rugs,

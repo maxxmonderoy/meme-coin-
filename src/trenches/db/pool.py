@@ -8,6 +8,32 @@ from typing import Any
 from .dialect import POSTGRES, SQLITE, Database, detect_dialect, to_postgres
 
 
+def sqlite_path(dsn: str) -> str:
+    """Resolve a SQLite DSN to a filesystem path.
+
+    Follows the usual URI convention, where the slash count is meaningful and
+    getting it wrong is silent:
+
+        sqlite:///tmp/x.db   -> /tmp/x.db      (three slashes: ABSOLUTE)
+        sqlite://./x.db      -> ./x.db         (relative)
+        sqlite://x.db        -> x.db           (relative)
+        sqlite://:memory:    -> :memory:
+        /tmp/x.db            -> /tmp/x.db      (bare path, no scheme)
+
+    The three-slash form is the one that matters: stripping the leading slash
+    turns an absolute path into a relative one, so the database is created
+    somewhere other than where it was asked for and everything still appears to
+    work -- migrations apply, rows insert -- against a file in the wrong place.
+    """
+    if "://" not in dsn:
+        return dsn
+    rest = dsn.split("://", 1)[1]
+    if rest == ":memory:" or rest.startswith(":memory:"):
+        return ":memory:"
+    # `sqlite:///abs` leaves a leading slash here, which IS the absolute path.
+    return rest or ":memory:"
+
+
 class SqliteDatabase(Database):
     """Single-connection SQLite with WAL.
 
@@ -26,7 +52,7 @@ class SqliteDatabase(Database):
     async def connect(dsn: str) -> SqliteDatabase:
         import aiosqlite
 
-        path = dsn.removeprefix("sqlite://").removeprefix("/") if "://" in dsn else dsn
+        path = sqlite_path(dsn)
         if path not in (":memory:",):
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         conn = await aiosqlite.connect(path, isolation_level=None)

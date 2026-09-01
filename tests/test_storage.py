@@ -278,3 +278,17 @@ async def test_outcome_row_round_trips_every_column(any_db):
     assert row["liquidity_usd"] == "12345.6"
     assert row["lateness_seconds"] == 7200
     assert row["backfilled"] == 1 or row["backfilled"] is True
+
+
+def test_sqlite_dsn_slash_count_is_respected():
+    """`sqlite:///abs` is ABSOLUTE. Stripping that leading slash silently
+    creates the database somewhere other than where it was asked for, and
+    everything keeps working -- migrations apply, rows insert -- against a file
+    in the wrong place."""
+    from trenches.db.pool import sqlite_path
+
+    assert sqlite_path("sqlite:///tmp/x.db") == "/tmp/x.db"
+    assert sqlite_path("sqlite://./x.db") == "./x.db"
+    assert sqlite_path("sqlite://x.db") == "x.db"
+    assert sqlite_path("sqlite://:memory:") == ":memory:"
+    assert sqlite_path("/tmp/x.db") == "/tmp/x.db"
