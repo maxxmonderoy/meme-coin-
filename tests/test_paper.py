@@ -351,3 +351,88 @@ async def test_summary_reports_the_3_9_6_concentration_check(any_db):
     assert int(s["closed"]) == 4
     # 1.0 of 1.2 gross profit is 83%: one trade carrying the whole result.
     assert s["largest_win_share"] > 0.20
+
+
+# -- stage 1 structural fetch ---------------------------------------------
+
+def test_extract_keeps_absent_and_false_distinct():
+    """Part 2's core distinction: a field GoPlus omitted is not a clean field.
+    Defaulting an absent flag to False would turn "we do not know" into "safe"
+    -- the most expensive mistake available here."""
+    from trenches.enrich.structural import extract
+
+    out = extract({"mintable": "0", "freezable": {"status": "1"}})
+    assert out["mintable"] is False          # present and clean
+    assert out["freezable"] is True          # present and dangerous
+    assert out["closable"] is None           # ABSENT, not clean
+    assert out["fields_present"] == 2
+
+
+def test_extract_reads_vendor_boolean_variants():
+    from trenches.enrich.structural import extract
+
+    assert extract({"mintable": 1})["mintable"] is True
+    assert extract({"mintable": "true"})["mintable"] is True
+    assert extract({"mintable": "0"})["mintable"] is False
+
+
+def test_extract_reports_nothing_present_for_an_empty_payload():
+    from trenches.enrich.structural import extract
+
+    out = extract({})
+    assert out["fields_present"] == 0
+    assert all(out[f] is None for f in ("mintable", "freezable", "closable"))
+
+
+async def test_structural_row_round_trips_and_reaches_the_cascade(any_db):
+    """The join is what lets stage 1 stop saying `unfetched`."""
+    from trenches.db import repo
+    from trenches.decide import Cascade
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="MS", stream_id=1, feed="f", fields={})
+    await repo.record_structural(any_db, mint="MS", fields={
+        "source": "goplus", "fetched_at": T0, "status_code": 200,
+        "mintable": False, "freezable": True, "fields_present": 2,
+    })
+    row, = [r for r in await repo.candidates_for_decision(any_db) if r["mint"] == "MS"]
+    assert row["freezable"] == 1
+
+    _, trail = Cascade().run(dict(row))
+    stage1 = next(v for v in trail if v.stage == 1)
+    assert stage1.rejected
+    assert "freeze authority live" in (stage1.reason or "")
+
+
+async def test_a_mint_with_no_probe_still_reports_unfetched(any_db):
+    """Absence must not silently become a pass."""
+    from trenches.db import repo
+    from trenches.decide import Cascade
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="MU", stream_id=1, feed="f", fields={})
+    row, = [r for r in await repo.candidates_for_decision(any_db) if r["mint"] == "MU"]
+
+    _, trail = Cascade().run(dict(row))
+    stage1 = next(v for v in trail if v.stage == 1)
+    assert stage1.accept
+    assert stage1.inputs.get("structural") == "unfetched"
+
+
+async def test_coverage_counts_asked_separately_from_answered(any_db):
+    """"Asked and got nothing" and "never asked" are different facts."""
+    from trenches.db import repo
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    for mint in ("A", "B", "C"):
+        await repo.upsert_token(any_db, mint=mint, stream_id=1, feed="f", fields={})
+    await repo.record_structural(any_db, mint="A", fields={
+        "source": "goplus", "fetched_at": T0, "mintable": True, "fields_present": 1})
+    await repo.record_structural(any_db, mint="B", fields={
+        "source": "goplus", "fetched_at": T0, "fields_present": 0, "error": "timeout"})
+
+    cov = await repo.structural_coverage(any_db)
+    assert cov["tokens"] == 3
+    assert cov["probed"] == 2        # asked twice
+    assert cov["with_fields"] == 1   # answered once
+    assert cov["would_reject"] == 1

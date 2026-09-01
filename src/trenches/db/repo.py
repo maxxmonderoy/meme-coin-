@@ -568,16 +568,28 @@ async def gap_attribution(db: Database, days: float = 7) -> dict:
 async def candidates_for_decision(db: Database, *, limit: int = 5000) -> list[dict]:
     """Candidates with no decision row yet, joined to what stages 0-2 need.
 
-    Creator counts come from the local cache (3.4 stage 2), so this is one
-    query and no network call. Structural facts are NOT joined: nothing has
-    fetched them, and stage 1 reports `unfetched` rather than implying a pass.
+    Creator counts come from the local cache (3.4 stage 2) and structural flags
+    from `token_structural`, so this is one query and no network call -- 3.4's
+    cost ordering stays a caller decision rather than a lookup hidden inside a
+    predicate.
+
+    A mint with no structural row joins to nulls, and stage 1 reports
+    `unfetched` for it. That is deliberate: absence must stay distinguishable
+    from a clean result, because reading empty as clean is Part 2's most
+    expensive mistake.
     """
     return await db.fetch(
         "select t.mint, t.signer, t.declared_creator, t.launchpad, t.symbol, "
         "       t.is_mayhem_mode, t.stream_id, "
-        "       c.n_mints as creator_n_mints, c.n_rugged as creator_n_rugged "
+        "       c.n_mints as creator_n_mints, c.n_rugged as creator_n_rugged, "
+        "       s.mintable, s.freezable, s.closable, s.balance_mutable_authority, "
+        "       s.transfer_fee_upgradable, s.transfer_hook_upgradable, "
+        "       s.metadata_mutable, s.default_account_state_upgradable, "
+        "       s.non_transferable, s.transfer_hook, s.transfer_fee, "
+        "       s.malicious_address "
         "from tokens_seen t "
         "left join creators c on c.address = t.signer and c.role = 'signer' "
+        "left join token_structural s on s.mint = t.mint "
         "left join decisions d on d.mint = t.mint "
         "where d.mint is null "
         "order by t.detected_at desc limit ?",
@@ -816,3 +828,79 @@ async def paper_summary(db: Database) -> dict:
         float(max(wins) / gross_profit) if wins and gross_profit > 0 else None
     )
     return row
+
+
+# -- structural facts (3.4 stage 1) ---------------------------------------
+
+async def record_structural(db: Database, *, mint: str, fields: dict) -> None:
+    """Store one structural probe.
+
+    Written even when the vendor returned nothing, because "asked and got
+    nothing" and "never asked" are different facts and stage 1 has to
+    distinguish them to keep saying `unfetched` honestly.
+    """
+    def flag(name: str):
+        value = fields.get(name)
+        return None if value is None else int(bool(value))
+
+    await db.execute(
+        "insert into token_structural ("
+        " mint, source, fetched_at, status_code, mintable, freezable, closable,"
+        " balance_mutable_authority, transfer_fee_upgradable, transfer_hook_upgradable,"
+        " metadata_mutable, default_account_state_upgradable, non_transferable,"
+        " transfer_hook, transfer_fee, malicious_address, fields_present, error, payload"
+        ") values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "on conflict (mint) do update set "
+        "  source = excluded.source, fetched_at = excluded.fetched_at,"
+        "  status_code = excluded.status_code, mintable = excluded.mintable,"
+        "  freezable = excluded.freezable, closable = excluded.closable,"
+        "  balance_mutable_authority = excluded.balance_mutable_authority,"
+        "  transfer_fee_upgradable = excluded.transfer_fee_upgradable,"
+        "  transfer_hook_upgradable = excluded.transfer_hook_upgradable,"
+        "  metadata_mutable = excluded.metadata_mutable,"
+        "  default_account_state_upgradable = excluded.default_account_state_upgradable,"
+        "  non_transferable = excluded.non_transferable,"
+        "  transfer_hook = excluded.transfer_hook, transfer_fee = excluded.transfer_fee,"
+        "  malicious_address = excluded.malicious_address,"
+        "  fields_present = excluded.fields_present, error = excluded.error,"
+        "  payload = excluded.payload",
+        mint, fields.get("source", "goplus"), iso(fields.get("fetched_at") or _now()),
+        fields.get("status_code"), flag("mintable"), flag("freezable"), flag("closable"),
+        flag("balance_mutable_authority"), flag("transfer_fee_upgradable"),
+        flag("transfer_hook_upgradable"), flag("metadata_mutable"),
+        flag("default_account_state_upgradable"), flag("non_transferable"),
+        fields.get("transfer_hook"), fields.get("transfer_fee"), flag("malicious_address"),
+        int(fields.get("fields_present") or 0), fields.get("error"),
+        dumps(fields.get("payload")),
+    )
+
+
+async def mints_needing_structural(db: Database, *, limit: int = 500) -> list[dict]:
+    """Mints with no structural probe yet, newest first.
+
+    Newest first on purpose: these facts are equally available at any age, but a
+    recent launch is the one a decision might still be made about.
+    """
+    return await db.fetch(
+        "select t.mint from tokens_seen t "
+        "left join token_structural s on s.mint = t.mint "
+        "where s.mint is null order by t.detected_at desc limit ?",
+        limit,
+    )
+
+
+async def structural_coverage(db: Database) -> dict:
+    total = await db.fetchval("select count(*) from tokens_seen") or 0
+    probed = await db.fetchval("select count(*) from token_structural") or 0
+    with_fields = await db.fetchval(
+        "select count(*) from token_structural where fields_present > 0"
+    ) or 0
+    flagged = await db.fetchval(
+        "select count(*) from token_structural where "
+        "coalesce(mintable,0)=1 or coalesce(freezable,0)=1 or coalesce(closable,0)=1 or "
+        "coalesce(balance_mutable_authority,0)=1 or coalesce(transfer_fee_upgradable,0)=1 or "
+        "coalesce(transfer_hook_upgradable,0)=1 or coalesce(metadata_mutable,0)=1 or "
+        "coalesce(default_account_state_upgradable,0)=1 or coalesce(non_transferable,0)=1"
+    ) or 0
+    return {"tokens": total, "probed": probed, "with_fields": with_fields,
+            "would_reject": flagged}

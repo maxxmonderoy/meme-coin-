@@ -493,6 +493,35 @@ async def cmd_paper(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_structural(cfg: Config, args: argparse.Namespace) -> int:
+    """Fetch the structural half of Part 2 so stage 1 stops reading `unfetched`.
+
+    Free and keyless. Reports how many probes came back with any fields at all,
+    because GoPlus omitting a field is a different fact from the token being
+    clean, and stage 1 depends on that distinction.
+    """
+    from .enrich.structural import fetch_batch
+
+    db = await pool_mod.connect(cfg.dsn)
+    try:
+        before = await repo.structural_coverage(db)
+        report = await fetch_batch(db, limit=args.limit)
+        after = await repo.structural_coverage(db)
+        print(f"probed {report['probed']} mint(s), {report['errors']} error(s), "
+              f"{report['with_fields']} returned usable fields")
+        print(f"coverage    {after['probed']:,} / {after['tokens']:,} tokens "
+              f"(+{after['probed'] - before['probed']:,})")
+        print(f"with fields {after['with_fields']:,}")
+        print(f"would fail stage 1: {after['would_reject']:,}")
+        if after["probed"] and not after["with_fields"]:
+            print("\n** every probe came back with no usable fields. That is a vendor")
+            print("   or endpoint problem, NOT a clean market -- stage 1 will keep")
+            print("   reporting `unfetched`, which is the honest answer (Part 2).")
+    finally:
+        await db.close()
+    return 0
+
+
 async def cmd_idl_check(cfg: Config, args: argparse.Namespace) -> int:
     from .decode import idl, idl_check
 
@@ -910,6 +939,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="double the slippage haircut (3.9.6's pessimistic clause)")
     paper.add_argument("--limit", type=int, default=5000)
 
+    structural = sub.add_parser(
+        "structural", help="fetch stage-1 structural facts (free, keyless)")
+    structural.add_argument("--limit", type=int, default=200)
+
     sub.add_parser("idl-check", help="diff the vendored IDL against upstream")
     sub.add_parser("prune", help="delete raw_events past the retention window")
     return parser
@@ -919,6 +952,7 @@ HANDLERS = {
     "migrate": cmd_migrate, "stream": cmd_stream, "stats": cmd_stats,
     "inspect": cmd_inspect, "verify-capture": cmd_verify_capture,
     "paper": cmd_paper,
+    "structural": cmd_structural,
     "idl-check": cmd_idl_check, "prune": cmd_prune,
     "label": cmd_label, "rules-report": cmd_rules_report, "gate": cmd_gate,
     "decide": cmd_decide, "rugs": cmd_rugs,
