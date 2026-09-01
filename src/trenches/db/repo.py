@@ -705,3 +705,114 @@ async def creators_at_risk(db: Database, *, min_mints: int, max_rug_rate: float)
             if rate >= max_rug_rate:
                 out.append({**r, "rug_rate": round(rate, 4)})
     return out
+
+
+# -- paper trading ---------------------------------------------------------
+
+async def insert_trade_tick(db: Database, *, mint: str, signature: str, fields: dict) -> bool:
+    """Store one observed trade. False when already seen (dedupe on signature)."""
+    status = await db.execute(
+        "insert into trade_ticks "
+        "(mint, signature, observed_at, is_buy, sol_amount, token_amount, price_sol, "
+        " trader, pool, source, payload) "
+        "values (?,?,?,?,?,?,?,?,?,?,?) on conflict (mint, signature) do nothing",
+        mint, signature, iso(fields.get("observed_at") or _now()),
+        None if fields.get("is_buy") is None else int(bool(fields["is_buy"])),
+        fields.get("sol_amount"), fields.get("token_amount"), fields.get("price_sol"),
+        fields.get("trader"), fields.get("pool"), fields.get("source", "pumpportal"),
+        dumps(fields.get("payload")),
+    )
+    return not status.endswith(" 0")
+
+
+async def ticks_for_mint(db: Database, mint: str, *, limit: int = 100_000) -> list[dict]:
+    return await db.fetch(
+        "select * from trade_ticks where mint = ? order by observed_at, signature limit ?",
+        mint, limit,
+    )
+
+
+async def open_paper_position(db: Database, *, mint: str, fields: dict) -> int:
+    await db.execute(
+        "insert into paper_positions ("
+        " mint, decision_id, mode, opened_at, status, bankroll_sol, size_pct, size_sol,"
+        " entry_at, entry_price_sol, entry_tick_sig, tokens_bought, entry_slippage_pct,"
+        " plan_tp_multiple, plan_trail_pct, plan_timeout_s, code_version, params"
+        ") values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        mint, fields.get("decision_id"), fields.get("mode", "PAPER"),
+        iso(fields["opened_at"]), "open", fields["bankroll_sol"], float(fields["size_pct"]),
+        fields["size_sol"], iso(fields.get("entry_at")), fields.get("entry_price_sol"),
+        fields.get("entry_tick_sig"), fields.get("tokens_bought"),
+        fields.get("entry_slippage_pct"), float(fields["plan_tp_multiple"]),
+        float(fields["plan_trail_pct"]), int(fields["plan_timeout_s"]),
+        fields["code_version"], dumps(fields.get("params")),
+    )
+    return await db.fetchval("select max(id) from paper_positions")
+
+
+async def close_paper_position(db: Database, position_id: int, fields: dict) -> None:
+    await db.execute(
+        "update paper_positions set status = 'closed', closed_at = ?, exit_reason = ?, "
+        "realised_sol = ?, fees_sol = ?, pnl_sol = ?, pnl_pct = ?, peak_price_sol = ?, "
+        "ticks_seen = ? where id = ?",
+        iso(fields.get("closed_at")), fields.get("exit_reason"), fields.get("realised_sol"),
+        fields.get("fees_sol"), fields.get("pnl_sol"),
+        None if fields.get("pnl_pct") is None else float(fields["pnl_pct"]),
+        fields.get("peak_price_sol"), fields.get("ticks_seen", 0), position_id,
+    )
+
+
+async def record_fill(db: Database, position_id: int, fields: dict) -> None:
+    await db.execute(
+        "insert into paper_fills ("
+        " position_id, kind, filled_at, tick_signature, quote_price_sol, fill_price_sol,"
+        " slippage_pct, tokens, gross_sol, fee_launchpad_sol, fee_priority_sol,"
+        " fee_tip_sol, fee_total_sol, net_sol"
+        ") values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        position_id, fields["kind"], iso(fields["filled_at"]), fields.get("tick_signature"),
+        fields.get("quote_price_sol"), fields.get("fill_price_sol"),
+        None if fields.get("slippage_pct") is None else float(fields["slippage_pct"]),
+        fields.get("tokens"), fields.get("gross_sol"), fields.get("fee_launchpad_sol"),
+        fields.get("fee_priority_sol"), fields.get("fee_tip_sol"),
+        fields.get("fee_total_sol"), fields.get("net_sol"),
+    )
+
+
+async def open_positions(db: Database) -> list[dict]:
+    return await db.fetch("select * from paper_positions where status = 'open'")
+
+
+async def paper_summary(db: Database) -> dict:
+    """What the journal says. Reported without commentary (part 0 rule 8).
+
+    Deliberately reports fees separately from PnL (1.10): without that split a
+    losing system reads as a winning one whose costs happen to be large.
+    """
+    row = await db.fetchrow(
+        "select count(*) as positions,"
+        "       sum(case when status = 'closed' then 1 else 0 end) as closed,"
+        "       sum(case when status = 'open' then 1 else 0 end) as still_open "
+        "from paper_positions"
+    ) or {}
+    closed = await db.fetch(
+        "select pnl_sol, fees_sol, size_sol, exit_reason, pnl_pct "
+        "from paper_positions where status = 'closed'"
+    )
+    pnls = [Decimal(r["pnl_sol"]) for r in closed if r.get("pnl_sol") is not None]
+    fees = [Decimal(r["fees_sol"]) for r in closed if r.get("fees_sol") is not None]
+    staked = [Decimal(r["size_sol"]) for r in closed if r.get("size_sol") is not None]
+    reasons: dict[str, int] = {}
+    for r in closed:
+        reasons[r.get("exit_reason") or "?"] = reasons.get(r.get("exit_reason") or "?", 0) + 1
+    wins = [p for p in pnls if p > 0]
+    row["net_pnl_sol"] = str(sum(pnls, Decimal(0)))
+    row["total_fees_sol"] = str(sum(fees, Decimal(0)))
+    row["total_staked_sol"] = str(sum(staked, Decimal(0)))
+    row["win_rate"] = (len(wins) / len(pnls)) if pnls else None
+    row["exit_reasons"] = reasons
+    # 3.9.6: no single trade above 20% of simulated profit.
+    gross_profit = sum(wins, Decimal(0))
+    row["largest_win_share"] = (
+        float(max(wins) / gross_profit) if wins and gross_profit > 0 else None
+    )
+    return row

@@ -32,6 +32,7 @@ import json
 import ssl
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import certifi
@@ -70,6 +71,23 @@ TLS = _tls_context()
 
 #: Verified against the official README.
 SUBSCRIBE_NEW_TOKEN = {"method": "subscribeNewToken"}
+
+#: Also verified against PumpPortal's own README, which documents
+#: `subscribeTokenTrade` taking a `keys` array of token addresses.
+#:
+#: THIS SHARES THE ONE SOCKET. 3.2 permits exactly one PumpPortal connection
+#: ever and a second concurrent one earns an hourly ban, so trade subscriptions
+#: are sent down the SAME connection that carries subscribeNewToken rather than
+#: opening another. That is why this lives on the existing consumer instead of
+#: in a second class.
+SUBSCRIBE_TOKEN_TRADE = "subscribeTokenTrade"  # noqa: S105 - a method name, not a secret
+
+#: NOT SOURCED. Their README documents three subscribe methods and no
+#: unsubscribe of any kind. Rather than invent `unsubscribeTokenTrade` and have
+#: it silently do nothing (part 0 rule 2), tracked mints are dropped
+#: CLIENT-SIDE: the server keeps sending, we stop storing. That wastes inbound
+#: bandwidth and nothing else.
+UNSUBSCRIBE_IS_UNDOCUMENTED = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +213,29 @@ def _as_int(value: object) -> int | None:
     return None
 
 
+#: Trade frames are as undocumented as create frames were. Same discipline:
+#: declare the hypothesis, validate every frame, keep the raw, never guess a
+#: value into a column. `mint` and `signature` are required because without them
+#: a tick cannot be attributed or deduped.
+#:
+#: The amount field names below come from the same third-party write-ups that
+#: got `creator` wrong for create frames, so treat them as unconfirmed until
+#: `verify-capture --kind trade` says otherwise.
+TRADE_SCHEMA = FrameSchema(
+    kind=EventKind.TRADE,
+    required=("mint", "signature"),
+    optional=(
+        "traderPublicKey", "txType", "tokenAmount", "solAmount", "newTokenBalance",
+        "bondingCurveKey", "vTokensInBondingCurve", "vSolInBondingCurve",
+        "marketCapSol", "pool", "tokensInPool", "solInPool",
+    ),
+    verified=False,
+)
+
+#: txType values that mean a trade rather than a creation.
+TRADE_TX_TYPES = frozenset({"buy", "sell"})
+
+
 class PumpPortalConsumer(Consumer):
     provider = "pumpportal"
     #: Launches arrive irregularly. websockets' own ping/pong keeps the socket
@@ -223,15 +264,53 @@ class PumpPortalConsumer(Consumer):
         #: module-level so the supervisor's close-before-reopen is what enforces
         #: it, but a second concurrent stream() on the same object still fails.
         self._in_use = asyncio.Lock()
+        #: Mints whose trades we want. Shared with the paper simulator: it adds
+        #: a mint when a position opens. Held here rather than in a second
+        #: consumer because there is only ever one socket.
+        self._tracked: set[str] = set()
+        #: Subscriptions already sent on the CURRENT socket. Cleared on
+        #: reconnect so the resubscribe is replayed -- the server has no memory
+        #: of a connection that dropped.
+        self._subscribed: set[str] = set()
+
+    # -- token trade subscriptions (shared socket) ------------------------
+    def track(self, mint: str) -> None:
+        """Start wanting trades for `mint`. Safe before the socket is open."""
+        self._tracked.add(mint)
+
+    def untrack(self, mint: str) -> None:
+        """Stop storing trades for `mint`.
+
+        Client-side only: PumpPortal documents no unsubscribe, so the server
+        keeps sending. See UNSUBSCRIBE_IS_UNDOCUMENTED.
+        """
+        self._tracked.discard(mint)
+
+    @property
+    def tracked(self) -> frozenset[str]:
+        return frozenset(self._tracked)
+
+    async def _flush_subscriptions(self) -> None:
+        """Send subscribeTokenTrade for anything tracked but not yet subscribed."""
+        pending = self._tracked - self._subscribed
+        if not pending or self._ws is None:
+            return
+        keys = sorted(pending)
+        await self._ws.send(json.dumps({"method": SUBSCRIBE_TOKEN_TRADE, "keys": keys}))
+        self._subscribed |= pending
+        log.info("subscribed to trades for %d mint(s) on the shared socket", len(keys))
 
     def subscription_descriptor(self) -> dict:
         return {
             "provider": self.provider,
             "url": self._url,
             "messages": [SUBSCRIBE_NEW_TOKEN],
+            "token_trade_method": SUBSCRIBE_TOKEN_TRADE,
             "subscribe_verified": True,
             "payload_schema_verified": NEW_TOKEN_SCHEMA.verified,
+            "trade_schema_verified": TRADE_SCHEMA.verified,
             "required_fields": list(NEW_TOKEN_SCHEMA.required),
+            "tracked_mints": len(self._tracked),
             "recording": str(self._record_dir) if self._record_dir else None,
             "role": "primary launch feed ($0 stack, 3.2)",
         }
@@ -266,6 +345,12 @@ class PumpPortalConsumer(Consumer):
             ) as ws:
                 self._ws = ws
                 await ws.send(json.dumps(SUBSCRIBE_NEW_TOKEN))
+                # A reconnect loses every server-side subscription, so replay
+                # them. Without this, a position opened before a drop goes
+                # unpriced for the rest of its life and the exit ladder simply
+                # never fires -- a silent stall confined to one position.
+                self._subscribed.clear()
+                await self._flush_subscriptions()
                 if not NEW_TOKEN_SCHEMA.verified:
                     log.warning(
                         "pumpportal payload schema is UNVERIFIED; validating every frame "
@@ -273,6 +358,9 @@ class PumpPortalConsumer(Consumer):
                         "`trenches verify-capture` on a recording to confirm it."
                     )
                 async for message in ws:
+                    # Positions opened since the last frame need subscribing.
+                    # Cheap: a set difference, and a no-op when nothing changed.
+                    await self._flush_subscriptions()
                     frame = self._record(message)
                     if frame is None:
                         continue
@@ -299,6 +387,12 @@ class PumpPortalConsumer(Consumer):
         # Subscription acknowledgement. Carries no market data.
         if frame.keys() <= {"message", "method"}:
             return RawEvent(provider=self.provider, event_kind=EventKind.PING, payload=frame)
+
+        # Trades are routed first: a trade frame validated against the create
+        # schema would be reported as a create mismatch, burying a working feed
+        # in false alarms.
+        if str(frame.get("txType", "")).lower() in TRADE_TX_TYPES:
+            return self._map_trade(frame)
 
         try:
             validate(frame, NEW_TOKEN_SCHEMA)
@@ -335,6 +429,46 @@ class PumpPortalConsumer(Consumer):
             signature=frame["signature"],
             block_time=block_time,
             payload={"raw": frame},
+        )
+
+    def _map_trade(self, frame: dict) -> RawEvent | None:
+        """Map a trade frame to a tick event.
+
+        Trades arrive for every mint we ever subscribed to, including ones whose
+        position has since closed -- there is no unsubscribe. Untracked mints
+        are dropped here rather than stored, which is the client-side half of
+        UNSUBSCRIBE_IS_UNDOCUMENTED.
+        """
+        try:
+            validate(frame, TRADE_SCHEMA)
+        except FrameSchemaMismatch as exc:
+            self.mismatches += 1
+            if self._strict:
+                raise
+            log.warning("pumpportal trade frame failed schema validation: %s", exc)
+            return RawEvent(
+                provider=self.provider, event_kind=EventKind.OTHER,
+                signature=frame.get("signature"),
+                payload={"raw": frame, "schema_mismatch": str(exc)},
+            )
+
+        mint = frame["mint"]
+        if mint not in self._tracked:
+            return None
+
+        price = trade_price_sol(frame)
+        return RawEvent(
+            provider=self.provider,
+            event_kind=EventKind.TRADE,
+            mint=mint,
+            signature=frame["signature"],
+            payload={
+                "raw": frame,
+                # Stringified: this crosses into storage as an exact decimal and
+                # must not become a float on the way.
+                "price_sol": str(price) if price is not None else None,
+                "is_buy": str(frame.get("txType", "")).lower() == "buy",
+            },
         )
 
     async def aclose(self) -> None:
@@ -420,3 +554,37 @@ def token_fields(frame: dict) -> dict:
 # populated: pump frames send an integer, bonk frames send 999999999.990125,
 # and converting tokens to base units exactly needs `decimals`, which this
 # feed does not carry. A null is honest; a rounded integer would not be.
+
+
+def _decimal(value: object) -> Decimal | None:
+    """Coerce a JSON number to an exact Decimal, or give up.
+
+    Decimal rather than float because these values feed a price and 3.10 keeps
+    floats out of every amount path. Going through `str` preserves the digits
+    the feed actually sent instead of a binary approximation of them.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def trade_price_sol(frame: dict) -> Decimal | None:
+    """Price per token in SOL, from the amounts on a single trade.
+
+    Uses the executed amounts rather than the reserve ratio. Both are present on
+    pump frames, but reserves describe the curve after the trade while
+    sol/token describes the fill actually obtained -- and a fill is what a paper
+    entry is pretending to be.
+
+    Returns None rather than a guess when either side is missing or zero. A
+    tick with no price is still stored; it just cannot move the ladder.
+    """
+    sol = _decimal(frame.get("solAmount"))
+    tokens = _decimal(frame.get("tokenAmount"))
+    if sol is None or tokens is None or tokens == 0:
+        return None
+    return sol / tokens

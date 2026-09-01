@@ -102,10 +102,14 @@ async def any_db(request, tmp_path):
         if not POSTGRES_DSN:
             pytest.skip("set TRENCHES_TEST_POSTGRES_DSN to run the Postgres pass")
         db = await pool_mod.connect(POSTGRES_DSN)
-        for table in ("outcomes", "mint_peaks", "decisions", "enrich_cache", "feed_health",
-                      "feed_latency", "raw_events", "tokens_seen", "creators", "streams",
-                      "schema_migrations"):
-            await db.execute(f"drop table if exists {table} cascade")
+        # Drop whatever is actually there rather than a hand-maintained list.
+        # A hardcoded list silently goes stale the moment a migration adds a
+        # table, and the symptom is state leaking between tests -- which looks
+        # exactly like a product bug and is not one.
+        for row in await db.fetch(
+            "select tablename from pg_tables where schemaname = current_schema()"
+        ):
+            await db.execute(f'drop table if exists "{row["tablename"]}" cascade')
     else:
         db = await pool_mod.connect(f"sqlite://{tmp_path}/test.db")
     await migrate_mod.migrate(db)

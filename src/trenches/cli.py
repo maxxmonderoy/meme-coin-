@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import datetime as dt
 import json
 import signal
 import sys
@@ -398,6 +399,98 @@ async def cmd_verify_capture(cfg: Config, args: argparse.Namespace) -> int:
         return 0
     print("\nSchema needs correction before it can be marked verified.")
     return 1
+
+
+async def cmd_paper(cfg: Config, args: argparse.Namespace) -> int:
+    """Report the paper journal, or replay stored ticks through the simulator.
+
+    Reports what the journal says without softening it (part 0 rule 8). A paper
+    run that loses money is a result, not a bug -- 1.9 puts the expected value
+    of an unfiltered trade at -7.85% after costs, so a cascade that rejects
+    nothing SHOULD lose here, and seeing that is the point.
+    """
+    from decimal import Decimal
+
+    from .paper.fees import FeeModel, round_trip_cost_pct
+    from .paper.runner import PaperRunner
+    from .paper.simulator import ExitPlan, Tick
+
+    db = await pool_mod.connect(cfg.dsn)
+    try:
+        model = FeeModel()
+        if args.pessimistic:
+            model = model.pessimistic()
+
+        if args.replay:
+            plan = ExitPlan()
+            runner = PaperRunner(
+                db, bankroll_sol=Decimal(str(args.bankroll)),
+                size_pct=Decimal(str(args.size_pct)), plan=plan, model=model,
+            )
+            mints = [r["mint"] for r in await db.fetch(
+                "select distinct mint from trade_ticks limit ?", args.limit)]
+            if not mints:
+                print("no trade_ticks stored. Run `trenches stream` with paper enabled "
+                      "so positions subscribe to their own trade tape first.")
+                return 1
+            for mint in mints:
+                runner.arm(mint)
+                for row in await repo.ticks_for_mint(db, mint):
+                    price = row.get("price_sol")
+                    await runner.on_tick(mint, Tick(
+                        at=dt.datetime.fromisoformat(row["observed_at"]),
+                        price_sol=Decimal(price) if price else None,
+                        signature=row["signature"],
+                        is_buy=bool(row["is_buy"]) if row["is_buy"] is not None else None,
+                    ))
+                await runner.sweep_timeouts()
+            print(f"replayed {len(mints)} mint(s) through the simulator")
+
+        size_sol = Decimal(str(args.bankroll)) * Decimal(str(args.size_pct)) / Decimal(100)
+        explicit = round_trip_cost_pct(model, size_sol, include_slippage=False) * 100
+        total = round_trip_cost_pct(model, size_sol) * 100
+        print(f"\ncost model{' (PESSIMISTIC: 2x slippage)' if args.pessimistic else ''}")
+        print(f"  position size          {size_sol} SOL "
+              f"({args.size_pct}% of {args.bankroll})")
+        print(f"  explicit friction      {explicit:>6.2f}%   (1.6 budgets ~4%)")
+        print(f"  with slippage haircut  {total:>6.2f}%   (3.9.2: wider than quote)")
+        print("  the haircut is a chosen parameter, not a measurement")
+
+        s = await repo.paper_summary(db)
+        print(f"\npositions   {int(s.get('positions') or 0):>6}   "
+              f"closed {int(s.get('closed') or 0)}   open {int(s.get('still_open') or 0)}")
+        if int(s.get("closed") or 0) == 0:
+            print("  nothing closed yet -- no result to report")
+            return 0
+        print(f"  staked      {Decimal(s['total_staked_sol']):>12.6f} SOL")
+        print(f"  net PnL     {Decimal(s['net_pnl_sol']):>12.6f} SOL")
+        print(f"  fees        {Decimal(s['total_fees_sol']):>12.6f} SOL   "
+              "(logged separately from PnL, 1.10)")
+        if s.get("win_rate") is not None:
+            print(f"  win rate    {s['win_rate']:>12.1%}")
+        print(f"  exits       {s.get('exit_reasons')}")
+
+        print("\n3.9.6 promotion criteria")
+        closed = int(s.get("closed") or 0)
+        net = Decimal(s["net_pnl_sol"])
+        share = s.get("largest_win_share")
+        checks = [
+            (f"300+ logged decisions ({closed})", closed >= 300),
+            (f"net positive after fees ({net:.6f} SOL)", net > 0),
+            (
+                "no single trade > 20% of profit"
+                + (f" ({share:.0%})" if share is not None else " (n/a)"),
+                share is None or share <= 0.20,
+            ),
+        ]
+        for label, ok in checks:
+            print(f"  [{'x' if ok else ' '}] {label}")
+        print("  [ ] spans >= 3 weeks  -- and the clock only counts once the")
+        print("      cascade actually rejects things; a filter that accepts")
+        print("      everything is measuring the market, not the filter")
+    finally:
+        await db.close()
+    return 0
 
 
 async def cmd_idl_check(cfg: Config, args: argparse.Namespace) -> int:
@@ -807,6 +900,16 @@ def build_parser() -> argparse.ArgumentParser:
     gate.add_argument("--days", type=float, default=7)
     gate.add_argument("-v", "--verbose", action="store_true", help="list every gap")
 
+    paper = sub.add_parser("paper", help="paper journal, cost model, and 3.9.6 progress")
+    paper.add_argument("--replay", action="store_true",
+                       help="replay stored trade_ticks through the simulator")
+    paper.add_argument("--bankroll", default="10", help="speculative bankroll in SOL")
+    paper.add_argument("--size-pct", default="1.0", dest="size_pct",
+                       help="percent of bankroll per position (1.9 hard cap: 2.0)")
+    paper.add_argument("--pessimistic", action="store_true",
+                       help="double the slippage haircut (3.9.6's pessimistic clause)")
+    paper.add_argument("--limit", type=int, default=5000)
+
     sub.add_parser("idl-check", help="diff the vendored IDL against upstream")
     sub.add_parser("prune", help="delete raw_events past the retention window")
     return parser
@@ -815,6 +918,7 @@ def build_parser() -> argparse.ArgumentParser:
 HANDLERS = {
     "migrate": cmd_migrate, "stream": cmd_stream, "stats": cmd_stats,
     "inspect": cmd_inspect, "verify-capture": cmd_verify_capture,
+    "paper": cmd_paper,
     "idl-check": cmd_idl_check, "prune": cmd_prune,
     "label": cmd_label, "rules-report": cmd_rules_report, "gate": cmd_gate,
     "decide": cmd_decide, "rugs": cmd_rugs,
