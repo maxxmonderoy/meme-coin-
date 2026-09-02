@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import datetime as dt
 import logging
+import time
 from decimal import Decimal, InvalidOperation
 
 from ..db import repo
@@ -118,6 +119,36 @@ class Sampler:
             self.admitted += 1
         return decision.cohort if ok else None
 
+    async def backfill_admissions(
+        self, *, limit: int = 200, now: dt.datetime | None = None
+    ) -> dict:
+        """Admit recent mints that are not being watched yet.
+
+        The sampler PULLS candidates out of tokens_seen rather than the stream
+        pushing them in. That is what keeps the two decoupled, and it is why the
+        sampler is useful on a database the stream populated hours ago.
+
+        Without this nothing ever enters the watch set and the loop observes an
+        empty set forever, which looks exactly like a hung process.
+        """
+        now = now or dt.datetime.now(tz=dt.UTC)
+        rows = await repo.mints_awaiting_admission(
+            self._db, limit=limit, max_age_seconds=self._max_age, now=now)
+        report = {"considered": len(rows), "admitted": 0, "by_cohort": {}}
+        for row in rows:
+            first_seen = (
+                dt.datetime.fromisoformat(row["block_time"]) if row.get("block_time")
+                else dt.datetime.fromisoformat(row["detected_at"])
+            )
+            cohort = await self.admit(
+                row["mint"], first_seen,
+                passes_filter=bool(row.get("accepted")), now=now,
+            )
+            if cohort:
+                report["admitted"] += 1
+                report["by_cohort"][cohort] = report["by_cohort"].get(cohort, 0) + 1
+        return report
+
     # -- observation -----------------------------------------------------
     async def tick(self, *, now: dt.datetime | None = None) -> dict:
         """One pass: take everything due, in batches, and record observations."""
@@ -194,14 +225,33 @@ class Sampler:
             )
         return recorded
 
-    async def run(self, *, interval_seconds: float = 5.0) -> None:
+    async def run(
+        self, *, interval_seconds: float = 5.0, heartbeat_seconds: float = 60.0
+    ) -> None:
         """Loop until cancelled. Never raises into the caller."""
         self.log_budget()
+        last_heartbeat = 0.0
         while True:
             try:
+                admitted = await self.backfill_admissions()
                 report = await self.tick()
-                if report["observed"]:
-                    kv(log, logging.INFO, "sampled", **report)
+                if report["observed"] or admitted["admitted"]:
+                    kv(log, logging.INFO, "sampled", **report,
+                       admitted=admitted["admitted"], cohorts=admitted["by_cohort"])
+                    last_heartbeat = time.monotonic()
+                elif time.monotonic() - last_heartbeat >= heartbeat_seconds:
+                    # A silent loop is indistinguishable from a hung one. Say
+                    # something periodically even when there is nothing to do,
+                    # and say WHY there is nothing to do -- an empty watch set
+                    # and a full one that is simply not due look identical from
+                    # the outside.
+                    counts = await repo.watch_set_counts(self._db)
+                    kv(log, logging.INFO, "idle",
+                       watch_set=sum(counts.values()), cohorts=counts,
+                       considered=admitted["considered"],
+                       note="no mints due" if counts else
+                            "watch set empty: no recent mints in tokens_seen to admit")
+                    last_heartbeat = time.monotonic()
             except asyncio.CancelledError:
                 raise
             except Exception:

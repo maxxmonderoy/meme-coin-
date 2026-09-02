@@ -674,7 +674,26 @@ async def cmd_sample(cfg: Config, args: argparse.Namespace) -> int:
             print("  and the falls from them, so dropping one would change a replay")
             return 0
         if args.once:
-            print(f"\n{await sampler.tick()}")
+            admitted = await sampler.backfill_admissions()
+            observed = await sampler.tick()
+            print(f"\n  admitted   {admitted['admitted']} of "
+                  f"{admitted['considered']} candidate(s) {admitted['by_cohort']}")
+            print(f"  observed   {observed}")
+            counts = await repo.watch_set_counts(db)
+            if counts.get("control") and not counts.get("filtered"):
+                # Correct but non-obvious: without decisions the filtered arm
+                # cannot fill, and an empty filtered cohort reads as a bug.
+                print("\n  Only the control cohort is filling. That is expected until")
+                print("  `trenches decide` has run: the filtered arm admits mints the")
+                print("  cascade ACCEPTED, while the control arm is a uniform random")
+                print("  sample that ignores every filter by design.")
+            if not admitted["considered"] and not observed["due"]:
+                counts = await repo.watch_set_counts(db)
+                if not counts:
+                    print("\n  Nothing to do: the watch set is empty and tokens_seen has")
+                    print("  no mints recent enough to admit. The sampler PULLS from")
+                    print("  tokens_seen, so run `trenches stream` first, or widen")
+                    print("  --max-age-hours if the mints you have are older than that.")
             return 0
         await sampler.run(interval_seconds=args.interval)
     except KeyboardInterrupt:
@@ -1253,6 +1272,14 @@ HANDLERS = {
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Line-buffer stdout. Python block-buffers when stdout is not a TTY, so a
+    # command that prints and then blocks in a loop -- `sample`, `stream`,
+    # `exits` -- produces NO output at all when redirected to a file or piped,
+    # which is indistinguishable from a hung process. This is the whole fix for
+    # "I didn't get any output".
+    with contextlib.suppress(AttributeError, ValueError):
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
     args = build_parser().parse_args(argv)
     try:
         cfg = Config.from_env()

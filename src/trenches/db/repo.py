@@ -1055,3 +1055,40 @@ async def mints_with_paths(db: Database, *, cohort: str | None = None,
 async def load_path_and_events(db: Database, mint: str) -> tuple[list[dict], list[dict]]:
     """Everything the exit engine replays for one mint."""
     return (await path_for_mint(db, mint), await events_for_mint(db, mint))
+
+
+async def mints_awaiting_admission(
+    db: Database, *, limit: int, max_age_seconds: int, now: dt.datetime | None = None
+) -> list[dict]:
+    """Recent mints with no watch-set row yet, newest first.
+
+    The sampler PULLS from here rather than the stream pushing to it. That is
+    what keeps the two decoupled: the stream writes tokens_seen and knows
+    nothing about sampling, and if the sampler is down the only consequence is
+    that admissions resume when it comes back.
+
+    Bounded by age because admitting a token already past `max_age_seconds`
+    would consume a watch-set slot for something the cadence would retire on its
+    first observation.
+
+    `accepted` reports whether the cascade accepted the mint, which is what the
+    `filtered` cohort keys on. Control-cohort mints ignore it entirely.
+
+    A mint that was considered and NOT admitted stays in this result on later
+    ticks, deliberately: `decide` may accept it after the sampler first saw it,
+    and dropping it permanently would mean the filtered arm could only ever
+    admit mints that happened to be decided before their first sampler tick.
+    The age bound is what keeps the reconsidered set from growing without limit.
+    """
+    now = now or _now()
+    cutoff = iso(now - dt.timedelta(seconds=max_age_seconds))
+    return await db.fetch(
+        "select t.mint, t.detected_at, t.block_time, "
+        "       case when d.outcome = 'accept' then 1 else 0 end as accepted "
+        "from tokens_seen t "
+        "left join watch_set w on w.mint = t.mint "
+        "left join decisions d on d.mint = t.mint "
+        "where w.mint is null and t.detected_at >= ? "
+        "order by t.detected_at desc limit ?",
+        cutoff, limit,
+    )

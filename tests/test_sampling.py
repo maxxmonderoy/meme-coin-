@@ -395,3 +395,108 @@ async def test_a_late_admission_lands_on_the_launch_relative_schedule(any_db):
     row = await any_db.fetchrow("select * from watch_set where mint = ?", "LATE")
     due = dt.datetime.fromisoformat(row["next_due_at"])
     assert (due - admitted_at).total_seconds() == 60
+
+
+async def test_admission_backfill_pulls_from_tokens_seen(any_db):
+    """The sampler PULLS rather than the stream pushing. Without this nothing
+    ever enters the watch set and the loop observes an empty set forever, which
+    looks exactly like a hung process."""
+    from trenches.db import repo
+    from trenches.sample.sampler import Sampler
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    now = dt.datetime.now(tz=dt.UTC)
+    for i in range(30):
+        await repo.upsert_token(any_db, mint=f"P{i}", stream_id=1, feed="pumpportal",
+                                fields={"block_time": now - dt.timedelta(minutes=1)})
+
+    sampler = Sampler(any_db, client=FakeClient())
+    report = await sampler.backfill_admissions(now=now)
+    assert report["considered"] == 30
+    assert report["admitted"] > 0
+    counts = await repo.watch_set_counts(any_db)
+    assert sum(counts.values()) == report["admitted"]
+
+
+async def test_an_admitted_mint_is_never_admitted_twice(any_db):
+    """Backfill runs every tick, so a watched mint must not get a second slot.
+
+    Note the deliberate asymmetry: a mint that was CONSIDERED and not admitted
+    is reconsidered on later ticks, because `decide` may accept it after the
+    sampler first saw it. Only admission is once-only.
+    """
+    from trenches.db import repo
+    from trenches.sample.sampler import Sampler
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    now = dt.datetime.now(tz=dt.UTC)
+    for i in range(30):
+        await repo.upsert_token(any_db, mint=f"D{i}", stream_id=1, feed="f",
+                                fields={"block_time": now})
+    sampler = Sampler(any_db, client=FakeClient())
+    first = await sampler.backfill_admissions(now=now)
+    before = await repo.watch_set_counts(any_db)
+    second = await sampler.backfill_admissions(now=now)
+    after = await repo.watch_set_counts(any_db)
+
+    assert first["admitted"] > 0
+    assert second["admitted"] == 0          # nothing admitted twice
+    assert before == after
+    assert await any_db.fetchval("select count(*) from watch_set") == first["admitted"]
+
+
+async def test_a_rejected_mint_is_reconsidered_once_a_decision_lands(any_db):
+    """A filtered-cohort mint failing the filter today may be accepted tomorrow;
+    reconsidering it is the point, not an inefficiency."""
+    from trenches.db import repo
+    from trenches.sample.sampler import Sampler
+    from trenches.sample.watchset import FILTERED, assign_cohort
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    now = dt.datetime.now(tz=dt.UTC)
+    mint = next(m for m in (f"R{i}" for i in range(200)) if assign_cohort(m) == FILTERED)
+    await repo.upsert_token(any_db, mint=mint, stream_id=1, feed="f",
+                            fields={"block_time": now})
+
+    sampler = Sampler(any_db, client=FakeClient())
+    assert (await sampler.backfill_admissions(now=now))["admitted"] == 0
+
+    await repo.record_decision(any_db, mint=mint, fields={
+        "mode": "PAPER", "outcome": "accept", "inputs": {}, "thresholds": {},
+        "code_version": "v"})
+    assert (await sampler.backfill_admissions(now=now))["admitted"] == 1
+
+
+async def test_stale_mints_do_not_consume_a_watch_slot(any_db):
+    """Admitting a token already past max age would burn a slot on something
+    the cadence retires on its first observation."""
+    from trenches.db import repo
+    from trenches.sample.sampler import Sampler
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    now = dt.datetime.now(tz=dt.UTC)
+    await repo.upsert_token(any_db, mint="OLD", stream_id=1, feed="f", fields={})
+    await any_db.execute("update tokens_seen set detected_at = ? where mint = ?",
+                         (now - dt.timedelta(days=5)).isoformat(), "OLD")
+
+    sampler = Sampler(any_db, client=FakeClient())
+    report = await sampler.backfill_admissions(now=now)
+    assert report["considered"] == 0
+
+
+async def test_only_the_control_arm_fills_without_decisions(any_db):
+    """The filtered arm admits mints the cascade ACCEPTED. With no decisions it
+    stays empty, which is correct and reads as a bug -- hence the CLI note."""
+    from trenches.db import repo
+    from trenches.sample.sampler import Sampler
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    now = dt.datetime.now(tz=dt.UTC)
+    for i in range(40):
+        await repo.upsert_token(any_db, mint=f"U{i}", stream_id=1, feed="f",
+                                fields={"block_time": now})
+    sampler = Sampler(any_db, client=FakeClient())
+    await sampler.backfill_admissions(now=now)
+    counts = await repo.watch_set_counts(any_db)
+    assert counts.get("control", 0) > 0
+    assert counts.get("filtered", 0) == 0
