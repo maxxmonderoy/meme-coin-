@@ -904,3 +904,145 @@ async def structural_coverage(db: Database) -> dict:
     ) or 0
     return {"tokens": total, "probed": probed, "with_fields": with_fields,
             "would_reject": flagged}
+
+
+# -- watch set and price paths (dense sampling) ---------------------------
+
+async def admit_to_watch_set(
+    db: Database, *, mint: str, cohort: str, first_seen: dt.datetime,
+    expires_at: dt.datetime, next_due_at: dt.datetime,
+) -> bool:
+    status = await db.execute(
+        "insert into watch_set (mint, cohort, admitted_at, expires_at, first_seen_at, "
+        "next_due_at) values (?,?,?,?,?,?) on conflict (mint) do nothing",
+        mint, cohort, iso(_now()), iso(expires_at), iso(first_seen), iso(next_due_at),
+    )
+    return not status.endswith(" 0")
+
+
+async def watch_set_counts(db: Database) -> dict[str, int]:
+    rows = await db.fetch(
+        "select cohort, count(*) as n from watch_set where state = 'active' group by cohort"
+    )
+    return {r["cohort"]: int(r["n"]) for r in rows}
+
+
+async def due_for_sampling(db: Database, *, limit: int, now: dt.datetime | None = None
+                           ) -> list[dict]:
+    """Active watch-set members whose next observation is due, oldest first.
+
+    Oldest-due first so a backlog drains in the order it accumulated rather than
+    starving whichever mints happen to sort last.
+    """
+    return await db.fetch(
+        "select * from watch_set where state = 'active' and next_due_at <= ? "
+        "order by next_due_at limit ?",
+        iso(now or _now()), limit,
+    )
+
+
+async def record_observation(db: Database, *, mint: str, fields: dict) -> bool:
+    status = await db.execute(
+        "insert into price_path ("
+        " mint, observed_at, scheduled_for, lateness_ms, source, status, venue_kind,"
+        " price_usd, price_native, liquidity_usd, fdv_usd, market_cap_usd, volume_m5,"
+        " volume_h1, txns_m5_buys, txns_m5_sells, pair_address, dex_id, age_seconds, payload"
+        ") values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "on conflict (mint, observed_at) do nothing",
+        mint, iso(fields["observed_at"]), iso(fields["scheduled_for"]),
+        int(fields.get("lateness_ms") or 0), fields["source"], fields["status"],
+        fields.get("venue_kind"), fields.get("price_usd"), fields.get("price_native"),
+        fields.get("liquidity_usd"), fields.get("fdv_usd"), fields.get("market_cap_usd"),
+        fields.get("volume_m5"), fields.get("volume_h1"), fields.get("txns_m5_buys"),
+        fields.get("txns_m5_sells"), fields.get("pair_address"), fields.get("dex_id"),
+        int(fields.get("age_seconds") or 0), dumps(fields.get("payload")),
+    )
+    return not status.endswith(" 0")
+
+
+async def advance_watch(
+    db: Database, *, mint: str, observed_at: dt.datetime,
+    next_due_at: dt.datetime | None, missed: bool = False,
+) -> None:
+    """Move a watch forward, or retire it when the cadence says it is done."""
+    if next_due_at is None:
+        await db.execute(
+            "update watch_set set state = 'expired', last_observed_at = ?, "
+            "next_due_at = null, observations = observations + ? , misses = misses + ? "
+            "where mint = ?",
+            iso(observed_at), 0 if missed else 1, 1 if missed else 0, mint,
+        )
+        return
+    await db.execute(
+        "update watch_set set last_observed_at = ?, next_due_at = ?, "
+        "observations = observations + ?, misses = misses + ? where mint = ?",
+        iso(observed_at), iso(next_due_at), 0 if missed else 1, 1 if missed else 0, mint,
+    )
+
+
+async def path_for_mint(db: Database, mint: str, *, limit: int = 100_000) -> list[dict]:
+    return await db.fetch(
+        "select * from price_path where mint = ? order by observed_at limit ?", mint, limit
+    )
+
+
+async def sampler_stats(db: Database, hours: float = 24) -> dict:
+    cutoff = _cutoff(hours)
+    counts = await watch_set_counts(db)
+    obs = await db.fetchval(
+        "select count(*) from price_path where observed_at >= ?", cutoff) or 0
+    by_status = {
+        r["status"]: int(r["n"]) for r in await db.fetch(
+            "select status, count(*) as n from price_path where observed_at >= ? "
+            "group by status", cutoff)
+    }
+    backlog = await db.fetchval(
+        "select count(*) from watch_set where state = 'active' and next_due_at <= ?",
+        iso(_now())) or 0
+    late = await db.fetch(
+        "select lateness_ms from price_path where observed_at >= ? and lateness_ms > 0",
+        cutoff)
+    return {
+        "cohorts": counts,
+        "watch_set": sum(counts.values()),
+        "observations": obs,
+        "observations_per_min": obs / (hours * 60) if hours else 0,
+        "by_status": by_status,
+        "backlog": backlog,
+        "lateness_ms": percentiles([int(r["lateness_ms"]) for r in late]),
+    }
+
+
+# -- structural events ------------------------------------------------------
+
+async def record_structural_event(db: Database, *, mint: str, fields: dict) -> bool:
+    status = await db.execute(
+        "insert into structural_events ("
+        " mint, event_type, detected_at, observed_at, derived_from, before_value,"
+        " after_value, delta_pct, severity, payload"
+        ") values (?,?,?,?,?,?,?,?,?,?) "
+        "on conflict (mint, event_type, detected_at) do nothing",
+        mint, fields["event_type"], iso(fields["detected_at"]), iso(fields["observed_at"]),
+        fields["derived_from"], fields.get("before_value"), fields.get("after_value"),
+        None if fields.get("delta_pct") is None else float(fields["delta_pct"]),
+        fields.get("severity"), dumps(fields.get("payload")),
+    )
+    return not status.endswith(" 0")
+
+
+async def events_for_mint(db: Database, mint: str) -> list[dict]:
+    return await db.fetch(
+        "select * from structural_events where mint = ? order by detected_at", mint
+    )
+
+
+async def mints_with_paths(db: Database, *, cohort: str | None = None,
+                           limit: int = 10_000) -> list[dict]:
+    if cohort:
+        return await db.fetch(
+            "select w.mint, w.cohort from watch_set w where w.cohort = ? "
+            "and exists (select 1 from price_path p where p.mint = w.mint) limit ?",
+            cohort, limit)
+    return await db.fetch(
+        "select w.mint, w.cohort from watch_set w "
+        "where exists (select 1 from price_path p where p.mint = w.mint) limit ?", limit)
