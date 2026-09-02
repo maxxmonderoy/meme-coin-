@@ -22,15 +22,46 @@ uv venv .venv
 uv pip install --python .venv/bin/python --require-hashes --only-binary :all: -r requirements.txt
 uv pip install --python .venv/bin/python -e . --no-deps   # provides the `trenches` command
 
+# ACTIVATE THE VENV, or `trenches` will not be on your PATH:
+source .venv/bin/activate                  # zsh/bash;  .venv/bin/activate.fish for fish
+# Not activating? Prefix every command with .venv/bin/ instead:
+#   .venv/bin/trenches migrate
+
 cp .env.example trenches.local.conf        # NOT `.env` — see §3.10.6
 export TRENCHES_ENV_FILE=trenches.local.conf
 
 trenches migrate
-trenches stream --record captures/
-trenches stats --hours 24
-trenches verify-capture captures/
-trenches inspect <mint> --enrich
 ```
+
+### Collecting
+
+```bash
+trenches stream --record captures/   # dual free feeds + paper positions
+trenches exits                       # exit loop, its own process (§3.1)
+trenches sample                      # dense price paths, its own process
+trenches structural --limit 200      # stage-1 structural facts (free, keyless)
+```
+
+Run `stream`, `exits` and `sample` in separate terminals. They share only the
+database — that is the point, and an entry-side stall must not stop an exit.
+
+### Looking at what you collected
+
+```bash
+trenches stats --hours 24            # feeds, watch set, budget utilisation, cohorts
+trenches inspect <mint>              # price path and event timeline together
+trenches decide                      # run the cascade, journal every verdict
+trenches paper                       # the paper journal and §3.9.6 progress
+trenches replay-exits                # compare exit rulesets, split by cohort
+trenches sample --compact            # downsample expired paths
+trenches verify-capture captures/    # confirm the PumpPortal frame schema
+```
+
+Start with `trenches sample --once` rather than `trenches sample`: it prints what
+it admitted and what it observed, and tells you what is missing if the answer is
+nothing. Two things that look broken and are not — only the `control` cohort
+fills until `trenches decide` has run, and `not_yet_indexed` dominates early
+because DexScreener has not indexed a brand new mint yet.
 
 No database server to install. SQLite is the default; Postgres is a
 connection-string change and both are covered by the same tests.
