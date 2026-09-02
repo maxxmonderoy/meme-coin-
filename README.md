@@ -17,21 +17,32 @@ evidence which could ever justify paying for a faster feed later.
 
 ## Quick start
 
-```bash
-uv venv .venv
-uv pip install --python .venv/bin/python --require-hashes --only-binary :all: -r requirements.txt
-uv pip install --python .venv/bin/python -e . --no-deps   # provides the `trenches` command
+Comments are deliberately kept OUT of this block: zsh does not treat `#` as a
+comment in an interactive shell unless `interactive_comments` is set, so a
+pasted block with inline comments fails on every one of them.
 
-# ACTIVATE THE VENV, or `trenches` will not be on your PATH:
-source .venv/bin/activate                  # zsh/bash;  .venv/bin/activate.fish for fish
-# Not activating? Prefix every command with .venv/bin/ instead:
-#   .venv/bin/trenches migrate
+Everything below assumes you are INSIDE the repository directory. `.venv` lives
+there, not in your home directory.
 
-cp .env.example trenches.local.conf        # NOT `.env` — see §3.10.6
+```zsh
+git clone https://github.com/maxxmonderoy/meme-coin-.git
+cd meme-coin-
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e . --no-deps
+cp .env.example trenches.local.conf
 export TRENCHES_ENV_FILE=trenches.local.conf
-
 trenches migrate
 ```
+
+`uv` is faster if you have it — `uv venv .venv` and `uv pip install --python
+.venv/bin/python ...` — but it is not required, and the hash-pinned install
+(§3.10.10) is `pip install --require-hashes -r requirements.txt` either way.
+
+Without activating the venv, prefix every command with `.venv/bin/` instead:
+`.venv/bin/trenches migrate`. The console script is installed there and is not
+on your PATH otherwise.
 
 ### Collecting
 
