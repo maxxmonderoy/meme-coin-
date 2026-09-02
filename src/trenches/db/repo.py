@@ -6,6 +6,7 @@ no dialect-specific casts. Time cutoffs and percentiles are computed in Python.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import itertools
 from decimal import Decimal, InvalidOperation
@@ -285,6 +286,9 @@ async def stats(db: Database, hours: float = 24) -> dict:
     totals["detect_latency_ms"] = percentiles([int(r["detect_latency_ms"]) for r in latencies])
     totals["per_feed"] = per_feed
     totals["feed_race"] = await feed_race_summary(db, hours)
+    with contextlib.suppress(Exception):
+        # Absent before migration 006; stats must still work on an older db.
+        totals["sampler"] = await sampler_stats(db, hours)
     return totals
 
 
@@ -1046,3 +1050,8 @@ async def mints_with_paths(db: Database, *, cohort: str | None = None,
     return await db.fetch(
         "select w.mint, w.cohort from watch_set w "
         "where exists (select 1 from price_path p where p.mint = w.mint) limit ?", limit)
+
+
+async def load_path_and_events(db: Database, mint: str) -> tuple[list[dict], list[dict]]:
+    """Everything the exit engine replays for one mint."""
+    return (await path_for_mint(db, mint), await events_for_mint(db, mint))

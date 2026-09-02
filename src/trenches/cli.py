@@ -255,6 +255,34 @@ async def cmd_stats(cfg: Config, args: argparse.Namespace) -> int:
                   f"creates={int(row['creates']):>7,} stale={int(row['stale']):>4} "
                   f"mismatch={int(row['mismatches']):>4} reconnects={int(row['reconnects']):>4}")
 
+    sampler = data.get("sampler")
+    if sampler and sampler.get("watch_set"):
+        from .label.dexscreener import BATCH_SIZE, RATE_LIMIT_PER_MINUTE
+        from .sample.cadence import compute_budget
+
+        budget = compute_budget(batch_size=BATCH_SIZE,
+                                requests_per_minute=RATE_LIMIT_PER_MINUTE)
+        watching = int(sampler["watch_set"])
+        obs_min = float(sampler.get("observations_per_min") or 0)
+        print("\n  SAMPLER")
+        print(f"    watch set          {watching:,} / {budget.watch_set_max:,} "
+              f"({watching / budget.watch_set_max:.0%} of derived capacity)")
+        for cohort, n in sorted((sampler.get("cohorts") or {}).items()):
+            print(f"      {cohort:<16} {int(n):,}")
+        print(f"    observations/min   {obs_min:,.1f} / "
+              f"{budget.observations_per_minute:,} "
+              f"({obs_min / budget.observations_per_minute:.0%} of budget)")
+        print(f"    backlog due now    {int(sampler.get('backlog') or 0):,}")
+        by_status = sampler.get("by_status") or {}
+        if by_status:
+            print(f"    by status          {by_status}")
+        if by_status.get("not_yet_indexed"):
+            print("      not_yet_indexed is the cold start, NOT a death signal")
+        lateness = sampler.get("lateness_ms") or {}
+        if lateness:
+            print(f"    lateness           p50 {lateness.get('p50')}ms "
+                  f"p90 {lateness.get('p90')}ms")
+
     race = data.get("feed_race") or []
     if race:
         total = sum(int(r["wins"]) for r in race) or 1
@@ -328,6 +356,24 @@ async def cmd_inspect(cfg: Config, args: argparse.Namespace) -> int:
                 print("        LOWER BOUND on the true peak -- we sample, we do not stream.")
         else:
             print(f"{args.mint} not in tokens_seen")
+
+        path, events = await repo.load_path_and_events(db, args.mint)
+        if path:
+            print(f"\n-- price path ({len(path)} observations) --")
+            for r in path[:args.path_limit]:
+                print(f"  {r['observed_at']}  {r['status']:<16} "
+                      f"px={r.get('price_usd') or '-':<14} "
+                      f"liq={r.get('liquidity_usd') or '-':<12} age={r['age_seconds']}s")
+            if len(path) > args.path_limit:
+                print(f"  ... {len(path) - args.path_limit} more")
+        if events:
+            # Interleaved with the path on purpose: the question is whether the
+            # structural signal fired BEFORE the price move completed.
+            print(f"\n-- structural events ({len(events)}) --")
+            for e in events:
+                print(f"  {e['detected_at']}  {e['event_type']:<22} "
+                      f"{e['severity'] or '':<5} {e.get('before_value')} -> "
+                      f"{e.get('after_value')}")
 
         if args.enrich:
             from .enrich.goplus import GoPlusClient
@@ -600,6 +646,136 @@ async def cmd_exits(cfg: Config, args: argparse.Namespace) -> int:
         return 130
     finally:
         await db.close()
+
+
+async def cmd_sample(cfg: Config, args: argparse.Namespace) -> int:
+    """Run the dense price-path sampler. Its own process; ingest never notices."""
+    from .sample.cadence import DEFAULT_CADENCE, describe
+    from .sample.sampler import Sampler
+
+    db = await pool_mod.connect(cfg.dsn)
+    try:
+        sampler = Sampler(
+            db, cadence=DEFAULT_CADENCE,
+            max_age_seconds=int(args.max_age_hours * 3600),
+            control_share=args.control_share,
+        )
+        for line in describe(sampler.budget):
+            print(f"  {line}")
+        if args.compact:
+            from .sample.compaction import compact
+
+            report = await compact(
+                db, older_than_seconds=int(args.compact_after_hours * 3600))
+            print(f"\ncompacted {report.mints} path(s): "
+                  f"{report.rows_before:,} -> {report.rows_after:,} rows "
+                  f"({report.removed:,} removed)")
+            print("  extremes are always kept: a trailing stop is a function of peaks")
+            print("  and the falls from them, so dropping one would change a replay")
+            return 0
+        if args.once:
+            print(f"\n{await sampler.tick()}")
+            return 0
+        await sampler.run(interval_seconds=args.interval)
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_replay_exits(cfg: Config, args: argparse.Namespace) -> int:
+    """Replay named rulesets over collected paths, split by cohort.
+
+    The comparison this whole change exists to produce. Fees and price impact
+    are applied; a rule that only wins before them has not won.
+    """
+    from decimal import Decimal
+
+    from .exits import report as report_mod
+    from .exits.cursor import Event, Observation
+    from .exits.engine import ExitEngine
+    from .exits.rules import library
+
+    rules = library()
+    wanted = args.rules.split(",") if args.rules else list(rules)
+    unknown = [r for r in wanted if r not in rules]
+    if unknown:
+        print(f"unknown ruleset(s): {unknown}. Available: {sorted(rules)}", file=sys.stderr)
+        return 2
+
+    db = await pool_mod.connect(cfg.dsn)
+    try:
+        mints = await repo.mints_with_paths(db, cohort=args.cohort, limit=args.limit)
+        if not mints:
+            print("no collected paths yet -- run `trenches sample` first")
+            return 1
+
+        engine = ExitEngine(
+            model=__import__("trenches.paper.fees", fromlist=["FeeModel"]).FeeModel()
+        )
+        loaded: dict[str, tuple[str, list, list]] = {}
+        for row in mints:
+            path_rows, event_rows = await repo.load_path_and_events(db, row["mint"])
+            observations = [Observation(
+                at=dt.datetime.fromisoformat(r["observed_at"]), status=r["status"],
+                price_usd=Decimal(r["price_usd"]) if r.get("price_usd") else None,
+                liquidity_usd=Decimal(r["liquidity_usd"]) if r.get("liquidity_usd") else None,
+                age_seconds=int(r["age_seconds"] or 0), venue_kind=r.get("venue_kind"),
+            ) for r in path_rows]
+            events = [Event(
+                at=dt.datetime.fromisoformat(e["detected_at"]),
+                event_type=e["event_type"], severity=e["severity"] or "warn",
+                delta_pct=e.get("delta_pct"),
+            ) for e in event_rows]
+            loaded[row["mint"]] = (row["cohort"], observations, events)
+
+        size = Decimal(str(args.size_usd))
+        rows: list = []
+        per_rule: dict[str, dict] = {}
+        for name in wanted:
+            replays_by_cohort: dict[str, list] = {}
+            per_rule[name] = {}
+            for mint, (cohort, obs, events) in loaded.items():
+                replay = engine.replay(mint=mint, cohort=cohort, rule=rules[name],
+                                       observations=obs, events=events, size_usd=size)
+                replays_by_cohort.setdefault(cohort, []).append(replay)
+                per_rule[name][mint] = replay
+            for cohort, replays in sorted(replays_by_cohort.items()):
+                rows.append(report_mod.summarise(replays, rule=name, cohort=cohort))
+
+        print(f"\nreplayed {len(loaded)} mint(s), position ${size} "
+              f"(size is compared against pool liquidity, so it must be USD)\n")
+        for line in report_mod.format_summary(rows):
+            print(line)
+
+        if "structural_first" in per_rule and "price_stop_only" in per_rule:
+            cmp_ = report_mod.compare_timing(
+                per_rule["structural_first"], per_rule["price_stop_only"])
+            print("\n  STRUCTURAL vs PRICE STOP -- did the structural signal fire first?")
+            print("    (only mints where BOTH fired; comparing across mints where only")
+            print("     one fired would compare different populations)")
+            print(f"    mints where both fired   {cmp_.mints_compared}")
+            if cmp_.mints_compared:
+                print(f"    structural first         {cmp_.structural_first} "
+                      f"({cmp_.structural_first_rate:.0%})")
+                print(f"    price stop first         {cmp_.price_first}")
+                print(f"    same observation         {cmp_.simultaneous}")
+                if cmp_.median_lead_seconds is not None:
+                    print(f"    median lead              {cmp_.median_lead_seconds:.0f}s")
+                print(f"    better outcome           {cmp_.better_fill_count}")
+                if cmp_.median_fill_gain is not None:
+                    print(f"    median gain              "
+                          f"{float(cmp_.median_fill_gain):+.3f}x")
+            else:
+                print("    nothing to compare yet -- needs paths where both rules fire")
+
+        print("\n  Impact assumes a balanced pool and uses liquidity from the LAST")
+        print("  observation, so mid-rug the real depth is lower than modelled.")
+        print("  These returns are therefore OPTIMISTIC, not conservative.")
+    finally:
+        await db.close()
+    return 0
 
 
 async def cmd_idl_check(cfg: Config, args: argparse.Namespace) -> int:
@@ -998,6 +1174,7 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--fresh", action="store_true",
                          help="request a cache bypass -- mandatory for held positions (3.4.6)")
     inspect.add_argument("--raw", action="store_true", help="dump raw payloads")
+    inspect.add_argument("--path-limit", type=int, default=40, dest="path_limit")
 
     verify = sub.add_parser("verify-capture",
                             help="check recorded PumpPortal frames against the declared schema")
@@ -1035,6 +1212,27 @@ def build_parser() -> argparse.ArgumentParser:
     exits.add_argument("--once", action="store_true")
     exits.add_argument("--pessimistic", action="store_true")
 
+    sample = sub.add_parser("sample", help="dense price-path sampler (own process)")
+    sample.add_argument("--interval", type=float, default=5.0)
+    sample.add_argument("--once", action="store_true")
+    sample.add_argument("--max-age-hours", type=float, default=24.0,
+                        dest="max_age_hours",
+                        help="24h default: the 1-7d tail costs 41.6%% of the rate budget")
+    sample.add_argument("--control-share", type=float, default=0.5, dest="control_share")
+    sample.add_argument("--compact", action="store_true",
+                        help="downsample expired paths instead of sampling")
+    sample.add_argument("--compact-after-hours", type=float, default=24.0,
+                        dest="compact_after_hours")
+
+    replay = sub.add_parser("replay-exits",
+                            help="replay exit rulesets over collected paths, by cohort")
+    replay.add_argument("--rules", default=None,
+                        help="comma-separated ruleset names (default: all)")
+    replay.add_argument("--cohort", default=None, choices=["filtered", "control"])
+    replay.add_argument("--size-usd", default="500", dest="size_usd",
+                        help="position size in USD; compared against pool liquidity")
+    replay.add_argument("--limit", type=int, default=5000)
+
     sub.add_parser("idl-check", help="diff the vendored IDL against upstream")
     sub.add_parser("prune", help="delete raw_events past the retention window")
     return parser
@@ -1046,6 +1244,8 @@ HANDLERS = {
     "paper": cmd_paper,
     "structural": cmd_structural,
     "exits": cmd_exits,
+    "sample": cmd_sample,
+    "replay-exits": cmd_replay_exits,
     "idl-check": cmd_idl_check, "prune": cmd_prune,
     "label": cmd_label, "rules-report": cmd_rules_report, "gate": cmd_gate,
     "decide": cmd_decide, "rugs": cmd_rugs,
