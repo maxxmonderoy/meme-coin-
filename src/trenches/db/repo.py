@@ -465,6 +465,42 @@ async def outcome_coverage(db: Database, horizons: tuple[str, ...]) -> dict:
     return out
 
 
+async def lateness_by_horizon(db: Database, horizons: tuple[str, ...]) -> dict:
+    """How far after its checkpoint each horizon was actually observed.
+
+    Without this, a backlog observed hours late is indistinguishable in the
+    report from one observed on time -- and the two mean completely different
+    things. A token first looked at when it was three hours old, recorded
+    against the 15m horizon, says nothing about minute fifteen.
+    """
+    out: dict[str, dict] = {}
+    for horizon in horizons:
+        rows = await db.fetch(
+            "select lateness_seconds from outcomes where horizon = ? "
+            "and lateness_seconds is not null", horizon)
+        values = [int(r["lateness_seconds"]) for r in rows]
+        out[horizon] = {
+            "n": len(values),
+            "on_time": sum(1 for v in values if v <= 60),
+            **percentiles(values),
+        }
+    return out
+
+
+async def unique_detection_rate(db: Database, hours: float) -> dict:
+    """Unique mints per minute, as distinct from feed sightings per minute.
+
+    Counting events conflates the two feeds seeing the SAME launch with two
+    launches. With two feeds running that overstates the detection rate by
+    roughly the overlap, which is most of it.
+    """
+    cutoff = _cutoff(hours)
+    mints = await db.fetchval(
+        "select count(*) from tokens_seen where detected_at >= ?", cutoff) or 0
+    return {"unique_mints": int(mints),
+            "unique_per_minute": (mints / (hours * 60)) if hours else 0.0}
+
+
 async def due_count(db: Database, horizon: str, horizon_seconds: int) -> int:
     cutoff = iso(_now() - dt.timedelta(seconds=horizon_seconds))
     return await db.fetchval(

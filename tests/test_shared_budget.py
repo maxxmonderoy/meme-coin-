@@ -183,3 +183,45 @@ async def test_derive_all_reports_what_it_could_not_answer(any_db):
     assert report.mints == 1
     assert report.skipped_no_observation == 1
     assert report.written == 0
+
+
+# -- reporting honesty -----------------------------------------------------
+
+async def test_lateness_is_reported_per_horizon(any_db):
+    """A horizon observed hours late is indistinguishable in the report from one
+    observed on time, and the two mean entirely different things."""
+    from trenches.db import repo
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    for i, late in enumerate([0, 0, 9000, 9000]):
+        mint = f"LT{i}"
+        await repo.upsert_token(any_db, mint=mint, stream_id=1, feed="f", fields={})
+        await repo.record_outcome(any_db, mint=mint, horizon="15m", fields={
+            "scheduled_for": T0, "observed_at": T0 + dt.timedelta(seconds=late),
+            "lateness_seconds": late, "status": "dead", "source": "dexscreener"})
+
+    out = await repo.lateness_by_horizon(any_db, ("15m",))
+    assert out["15m"]["n"] == 4
+    assert out["15m"]["on_time"] == 2
+    assert out["15m"]["p90"] == 9000
+
+
+async def test_unique_detection_rate_is_not_the_sum_of_feed_sightings(any_db):
+    """Two feeds seeing the SAME launch is one detection, not two. Counting
+    events overstates the rate by roughly the overlap, which is most of it."""
+    from trenches.db import repo
+    from trenches.stream.base import EventKind, RawEvent
+
+    sid = await repo.open_stream(any_db, feeds=["a", "b"], subscription={},
+                                 code_version="v")
+    for i in range(5):
+        await repo.upsert_token(any_db, mint=f"UQ{i}", stream_id=sid, feed="pumpportal",
+                                fields={})
+        for feed in ("pumpportal", "rugcheck"):
+            await repo.insert_raw_event(any_db, RawEvent(
+                provider=feed, event_kind=EventKind.CREATE, mint=f"UQ{i}",
+                signature=f"{feed}-{i}"), sid)
+
+    rate = await repo.unique_detection_rate(any_db, hours=1)
+    assert rate["unique_mints"] == 5          # not 10
+    assert await any_db.fetchval("select count(*) from raw_events") == 10

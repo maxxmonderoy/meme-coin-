@@ -213,6 +213,10 @@ async def cmd_stats(cfg: Config, args: argparse.Namespace) -> int:
         data = await repo.stats(db, hours=args.hours)
         coverage = await repo.outcome_coverage(db, HORIZONS)
         due = {h: await repo.due_count(db, h, HORIZON_SECONDS[h]) for h in HORIZONS}
+        # Fetched here, with the connection still open: a horizon observed hours
+        # late is indistinguishable in the report from one observed on time, and
+        # the two mean entirely different things.
+        horizon_lateness = await repo.lateness_by_horizon(db, HORIZONS)
     finally:
         await db.close()
 
@@ -233,8 +237,14 @@ async def cmd_stats(cfg: Config, args: argparse.Namespace) -> int:
     # The 3.8.8 canary: a rate, not a total. A feed that broke an hour ago has
     # a healthy-looking total and a current rate of zero.
     if minutes:
-        print(f"\n  DETECTION RATE     {creates / minutes:>9.2f} creates/min"
-              f"   ({events / minutes:,.1f} events/min)")
+        unique = int(data.get("unique_mints") or 0)
+        unique_rate = unique / minutes if minutes else 0.0
+        print(f"\n  DETECTION RATE     {unique_rate:>9.2f} unique mints/min"
+              f"   (~{unique_rate * 1440:,.0f}/day)")
+        print(f"    feed sightings   {creates / minutes:>9.2f} /min across all feeds "
+              f"({events:,} events)")
+        print("    the two differ because both feeds see the same launch; only the")
+        print("    first line is a detection rate")
         if creates == 0:
             print("  ** zero creates across the whole window -- check the feeds and the")
             print("     schema mismatch count, not just the error count (3.8.8)")
@@ -303,6 +313,17 @@ async def cmd_stats(cfg: Config, args: argparse.Namespace) -> int:
         bucket = coverage["horizons"][horizon]
         split = " ".join(f"{k}={v:,}" for k, v in sorted(bucket["status"].items())) or "-"
         venue = " ".join(f"{k}={v:,}" for k, v in sorted(bucket["venue"].items())) or "-"
+        late = (horizon_lateness or {}).get(horizon) or {}
+        if late.get("n"):
+            p50 = late.get("p50") or 0
+            marker = "  ** " if p50 > HORIZON_SECONDS[horizon] else "     "
+            print(f"{marker}lateness p50 {p50:,}s p90 {late.get('p90') or 0:,}s  "
+                  f"on-time {late['on_time']:,}/{late['n']:,}")
+            if p50 > HORIZON_SECONDS[horizon]:
+                print(f"         median observation is later than the {horizon} horizon "
+                      "itself --")
+                print("         these rows say what the token looked like WHEN OBSERVED,")
+                print(f"         not at {horizon}. Do not read them as a {horizon} rate.")
         print(f"    {horizon:<4} observed={bucket['observed']:>7,} "
               f"backfilled={bucket['backfilled']:>7,} "
               f"due_unobserved={due[horizon]:>7,}   {split}")
