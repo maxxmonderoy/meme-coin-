@@ -313,7 +313,12 @@ async def test_compaction_records_what_it_did(any_db):
     await repo.admit_to_watch_set(
         any_db, mint="MC", cohort="control", first_seen=T0,
         expires_at=T0 + dt.timedelta(hours=24), next_due_at=T0)
-    await any_db.execute("update watch_set set state = 'expired' where mint = ?", "MC")
+    # Pin admitted_at instead of letting it default to wall clock: compaction
+    # selects on it, so a wall-clock value makes this test pass or fail
+    # depending on what time of day the suite runs.
+    await any_db.execute(
+        "update watch_set set state = 'expired', admitted_at = ? where mint = ?",
+        T0.isoformat(), "MC")
     for i in range(40):
         await repo.record_observation(any_db, mint="MC", fields={
             "observed_at": T0 + dt.timedelta(seconds=30 * i),

@@ -500,3 +500,29 @@ async def test_only_the_control_arm_fills_without_decisions(any_db):
     counts = await repo.watch_set_counts(any_db)
     assert counts.get("control", 0) > 0
     assert counts.get("filtered", 0) == 0
+
+
+def test_transport_chatter_is_silenced_by_default():
+    """httpx logs one line per request and the poller runs every two seconds.
+    At INFO that is ~30 lines/min of "200 OK" burying every real event -- and
+    3.8.8's canary is a DROP in detections, which is invisible in a log that is
+    almost entirely transport chatter."""
+    import logging as pylogging
+
+    from trenches import log as logmod
+
+    logmod.setup("INFO")
+    assert pylogging.getLogger("httpx").level == pylogging.WARNING
+    assert pylogging.getLogger("trenches.sample.sampler").getEffectiveLevel() \
+        == pylogging.INFO
+
+
+def test_noisy_logging_can_be_turned_back_on(monkeypatch):
+    import logging as pylogging
+
+    from trenches import log as logmod
+
+    monkeypatch.setenv("TRENCHES_LOG_NOISY", "1")
+    logmod.setup("INFO")
+    assert pylogging.getLogger("httpx").getEffectiveLevel() == pylogging.INFO
+    logmod.setup("INFO")   # restore for the rest of the suite
