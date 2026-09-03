@@ -220,7 +220,7 @@ watchdog can catch it, a live feed sends a clean EOF, four failures fire in a
 row to test bounded backoff, and events are replayed to prove dedupe. A soak
 says "nothing went wrong"; this says "we made it go wrong and nothing was lost".
 
-## Week 2: the cascade, stages 0-2 (paper only)
+## The cascade, stages 0-3 (paper only)
 
 ```bash
 trenches decide --limit 5000     # journal a verdict for every candidate
@@ -249,6 +249,42 @@ report rather than hide.** Two reasons, both stated in the command's own output:
 
 A cascade that accepts everything is not a filter. It is a filter with no data,
 and the difference is worth keeping visible.
+
+### Stage 3: liquidity, LP lock state, unlock horizon
+
+Four rejections, in the order they cost money: already flagged `rugged`;
+liquidity below the floor; LP neither burned nor locked; and 3.4's free check
+that almost nobody does -- **the lock expiring inside the holding horizon**. A
+lock that ends while you hold is not a lock, it is a countdown, and the deployer
+chose when it ends.
+
+```bash
+TRENCHES_DECIDE_MIN_LIQUIDITY_USD=5000        # UNCALIBRATED, see below
+TRENCHES_DECIDE_HOLD_HORIZON_SECONDS=21600
+```
+
+**The floor is an assumption, not a finding, and every journal row says so.**
+3.4 gives no liquidity number, and 1.2's $1,000 figure is Solidus's measure of a
+token being effectively *dead*, not a floor for entry. `thresholds()` therefore
+records `calibrated: false` alongside the number, so a later tuning pass against
+matched controls cannot quietly rewrite what earlier rows meant.
+
+**Stage 3 spends no request.** Liquidity comes from the most recent `price_path`
+observation the sampler already collected, and `rugged` from the structural
+event timeline. Both have verified sources in this repo -- DexScreener's
+`liquidity.usd` and RugCheck's top-level `rugged`.
+
+**Half of stage 3 has no supplier, and that is stated rather than faked.** LP
+lock state and the locker's `unlockDate` are real fields 3.4 names, but nothing
+here has confirmed which field of a RugCheck report carries them, so they
+journal as `unknown` -- never as a pass. Part 0 rule 2: a plausible-sounding
+field path is worse than a gap.
+
+The distinction the code works hardest to keep is between **unknown** and
+**clean**. A candidate nobody fetched records `{"liquidity": "unfetched"}`; a
+candidate with liquidity but no lock data records the liquidity and marks the
+rest `unknown`. Those are different facts, and a journal that cannot tell them
+apart is the one that later justifies a loss.
 
 ## Derived rug labels
 

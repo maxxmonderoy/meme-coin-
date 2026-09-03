@@ -1102,6 +1102,8 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
     cascade = Cascade(
         min_mints=cfg.decide_creator_min_mints,
         max_rug_rate=cfg.decide_creator_max_rug_rate,
+        min_liquidity_usd=cfg.decide_min_liquidity_usd,
+        hold_horizon_seconds=cfg.decide_hold_horizon_seconds,
     )
     thresholds = cascade.thresholds()
     version = code_version()
@@ -1145,9 +1147,13 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
         for stage, n in sorted(summary["by_stage"].items()):
             print(f"    stage {stage}: {n:,}")
     if accepted == len(rows):
-        print("\n  NOTE every candidate was accepted. Stage 1 has no structural facts to")
-        print("  read (nothing fetches them yet) and stage 2 cannot fire because n_rugged")
-        print("  is zero everywhere -- nothing labels rugs. That is unlabelled, not clean.")
+        print("\n  NOTE every candidate was accepted. Run `structural` to give stage 1")
+        print("  something to read, `rugs` to fill n_rugged so stage 2 can fire, and")
+        print("  `sample` to collect the liquidity stage 3 reads. Until then this is")
+        print("  UNLABELLED, not clean.")
+    print("\n  Stage 3 is half-supplied: liquidity and `rugged` come from data already")
+    print("  collected, but LP lock state and unlock date have no verified field path")
+    print("  in this repo, so they journal as `unknown` rather than as a pass.")
     return 0
 
 

@@ -655,17 +655,27 @@ async def gap_attribution(db: Database, days: float = 7) -> dict:
 # -- decisions -------------------------------------------------------------
 
 async def candidates_for_decision(db: Database, *, limit: int = 5000) -> list[dict]:
-    """Candidates with no decision row yet, joined to what stages 0-2 need.
+    """Candidates with no decision row yet, joined to what stages 0-3 need.
 
-    Creator counts come from the local cache (3.4 stage 2) and structural flags
-    from `token_structural`, so this is one query and no network call -- 3.4's
-    cost ordering stays a caller decision rather than a lookup hidden inside a
-    predicate.
+    Creator counts come from the local cache (3.4 stage 2), structural flags
+    from `token_structural`, and stage 3's liquidity from the most recent
+    `price_path` observation the sampler already collected -- so this is one
+    query and no network call. 3.4's cost ordering stays a caller decision
+    rather than a lookup hidden inside a predicate.
 
     A mint with no structural row joins to nulls, and stage 1 reports
     `unfetched` for it. That is deliberate: absence must stay distinguishable
     from a clean result, because reading empty as clean is Part 2's most
     expensive mistake.
+
+    STAGE 3 IS ONLY HALF SUPPLIED HERE, and the missing half is named rather
+    than guessed. `liquidity_usd` and `rugged` have verified sources in this
+    repo: DexScreener's `liquidity.usd` (see `label/dexscreener.py`) and
+    RugCheck's top-level `rugged` (see `structural/detectors.py`). `lp_state`
+    and `lp_unlock_date` do NOT -- nothing here has confirmed which field of a
+    RugCheck report carries the locker's `unlockDate`, so those stay absent and
+    stage 3 records them as unknown. Part 0 rule 2: a plausible-sounding field
+    path is worse than a gap.
     """
     return await db.fetch(
         "select t.mint, t.signer, t.declared_creator, t.launchpad, t.symbol, "
@@ -675,7 +685,19 @@ async def candidates_for_decision(db: Database, *, limit: int = 5000) -> list[di
         "       s.transfer_fee_upgradable, s.transfer_hook_upgradable, "
         "       s.metadata_mutable, s.default_account_state_upgradable, "
         "       s.non_transferable, s.transfer_hook, s.transfer_fee, "
-        "       s.malicious_address "
+        "       s.malicious_address, "
+        # Correlated scalar subqueries rather than a window function or a
+        # lateral join: identical text runs on SQLite and Postgres, and
+        # (mint, observed_at) is already indexed on price_path.
+        "       (select p.liquidity_usd from price_path p "
+        "          where p.mint = t.mint and p.liquidity_usd is not null "
+        "          order by p.observed_at desc limit 1) as liquidity_usd, "
+        "       (select p.observed_at from price_path p "
+        "          where p.mint = t.mint and p.liquidity_usd is not null "
+        "          order by p.observed_at desc limit 1) as liquidity_observed_at, "
+        "       (select 1 from structural_events e "
+        "          where e.mint = t.mint and e.event_type = 'rugged' "
+        "          limit 1) as rugged "
         "from tokens_seen t "
         "left join creators c on c.address = t.signer and c.role = 'signer' "
         "left join token_structural s on s.mint = t.mint "

@@ -1,4 +1,4 @@
-"""The decision layer. Week 2: stages 0-2, PAPER only.
+"""The decision layer. Stages 0-3, PAPER only.
 
 Nothing in this package can construct or sign a transaction, and there is no
 `execute()`. `mode` is a column on `decisions`, never a fork in the code
@@ -18,6 +18,10 @@ from .cascade import (
     stage0_ingest,
     stage1_structural,
     stage2_creator,
+    stage3_liquidity,
 )
 
-__all__ = ["Cascade", "Verdict", "stage0_ingest", "stage1_structural", "stage2_creator"]
+__all__ = [
+    "Cascade", "Verdict",
+    "stage0_ingest", "stage1_structural", "stage2_creator", "stage3_liquidity",
+]

@@ -91,6 +91,8 @@ class Config:
     label_peak_multiple: float
     decide_creator_min_mints: int
     decide_creator_max_rug_rate: float
+    decide_min_liquidity_usd: float
+    decide_hold_horizon_seconds: int
     log_level: str = field(default="INFO")
 
     @staticmethod
@@ -150,6 +152,11 @@ class Config:
             label_peak_multiple=_get_float("TRENCHES_LABEL_PEAK_MULTIPLE", 2.0),
             decide_creator_min_mints=_get_int("TRENCHES_DECIDE_CREATOR_MIN_MINTS", 3),
             decide_creator_max_rug_rate=_get_float("TRENCHES_DECIDE_CREATOR_MAX_RUG_RATE", 0.6),
+            # UNCALIBRATED (3.4 gives no liquidity number). Overridable from the
+            # environment precisely so tuning it is a recorded, deliberate act --
+            # `thresholds()` snapshots whatever it ends up being into every row.
+            decide_min_liquidity_usd=_get_float("TRENCHES_DECIDE_MIN_LIQUIDITY_USD", 5000.0),
+            decide_hold_horizon_seconds=_get_int("TRENCHES_DECIDE_HOLD_HORIZON_SECONDS", 6 * 3600),
             log_level=_get("TRENCHES_LOG_LEVEL", "INFO"),
         )
         if cfg.workers < 1:

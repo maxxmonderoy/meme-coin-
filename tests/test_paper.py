@@ -419,6 +419,70 @@ async def test_a_mint_with_no_probe_still_reports_unfetched(any_db):
     assert stage1.inputs.get("structural") == "unfetched"
 
 
+async def test_stage_3_reads_the_latest_stored_liquidity_observation(any_db):
+    """Stage 3 spends no request: it reads the price path the sampler already
+    collected. The subquery is correlated rather than a window function so the
+    same SQL text runs on both dialects -- which is what this asserts."""
+    import datetime as dt
+
+    from trenches.db import repo
+    from trenches.decide import Cascade
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="ML", stream_id=1, feed="f", fields={})
+    for minutes, liquidity in ((5, "90000"), (10, "120"), (12, None)):
+        at = T0 + dt.timedelta(minutes=minutes)
+        await repo.record_observation(any_db, mint="ML", fields={
+            "observed_at": at, "scheduled_for": at, "source": "dexscreener",
+            "status": "indexed", "liquidity_usd": liquidity, "age_seconds": 60,
+        })
+
+    row, = [r for r in await repo.candidates_for_decision(any_db) if r["mint"] == "ML"]
+    # The newest row with a liquidity value wins; the later null does not erase it.
+    assert str(row["liquidity_usd"]) == "120"
+    assert row["liquidity_observed_at"] is not None
+
+    _, trail = Cascade().run(dict(row))
+    stage3 = next(v for v in trail if v.stage == 3)
+    assert stage3.rejected
+    assert "below the" in (stage3.reason or "")
+    assert stage3.inputs["liquidity_age_seconds"] > 0
+
+
+async def test_a_recorded_rug_event_rejects_at_stage_3(any_db):
+    """The cheapest rejection there is, and it comes from a table we already
+    fill -- no extra call."""
+    from trenches.db import repo
+    from trenches.decide import Cascade
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="MR", stream_id=1, feed="f", fields={})
+    await repo.record_structural_event(any_db, mint="MR", fields={
+        "event_type": "rugged", "detected_at": T0, "observed_at": T0,
+        "derived_from": "rugcheck_poll", "severity": "critical",
+    })
+
+    row, = [r for r in await repo.candidates_for_decision(any_db) if r["mint"] == "MR"]
+    verdict, _ = Cascade().run(dict(row))
+    assert verdict.rejected and verdict.stage == 3
+    assert "rugged" in (verdict.reason or "")
+
+
+async def test_a_mint_with_no_observations_reaches_stage_3_as_unfetched(any_db):
+    """Nothing collected must not read as three checks passed."""
+    from trenches.db import repo
+    from trenches.decide import Cascade
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="MN", stream_id=1, feed="f", fields={})
+    row, = [r for r in await repo.candidates_for_decision(any_db) if r["mint"] == "MN"]
+
+    _, trail = Cascade().run(dict(row))
+    stage3 = next(v for v in trail if v.stage == 3)
+    assert stage3.accept
+    assert stage3.inputs == {"liquidity": "unfetched"}
+
+
 async def test_coverage_counts_asked_separately_from_answered(any_db):
     """"Asked and got nothing" and "never asked" are different facts."""
     from trenches.db import repo

@@ -1,4 +1,4 @@
-"""Stages 0-2 of the 3.4 cascade, as pure functions.
+"""Stages 0-3 of the 3.4 cascade, as pure functions.
 
 ORDERING SAVES MORE MONEY THAN CACHING (3.4). Stages run cheapest-first so the
 ~95% of candidates that die early never reach a paid lookup. Each stage here is
@@ -17,6 +17,7 @@ against labeled outcomes -- not something this module asserts.
 """
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -157,6 +158,150 @@ def stage2_creator(
     return Verdict(True, 2, None, seen)
 
 
+#: 3.4 stage 3. Liquidity floor in USD.
+#:
+#: UNCALIBRATED. 3.4 does not give a number, and 1.2's $1,000 figure is Solidus's
+#: measure of a token being effectively dead, not a floor for entry. This is a
+#: starting point to be tuned against matched controls once the dense paths have
+#: accumulated -- until then it is an assumption the journal records rather than
+#: a finding, and `thresholds()` snapshots it so tuning later cannot silently
+#: rewrite what earlier rows meant.
+DEFAULT_MIN_LIQUIDITY_USD = 5_000.0
+
+#: Reject if the LP unlocks inside the holding horizon. 3.4: "check the locker's
+#: unlockDate -- reject if it unlocks inside the holding horizon. Almost nobody
+#: does that last one and it's free." A lock that expires while you hold is not
+#: a lock, it is a countdown.
+DEFAULT_HOLD_HORIZON_SECONDS = 6 * 3600
+
+#: LP states that count as locked. Anything else -- including absent -- is
+#: treated as UNKNOWN rather than safe.
+LP_SAFE_STATES = ("burned", "locked")
+
+
+def stage3_liquidity(
+    facts: dict,
+    *,
+    min_liquidity_usd: float = DEFAULT_MIN_LIQUIDITY_USD,
+    hold_horizon_seconds: int = DEFAULT_HOLD_HORIZON_SECONDS,
+    now: dt.datetime | None = None,
+) -> Verdict:
+    """One request's worth of liquidity facts (3.4 stage 3).
+
+    Four rejections, in the order they cost you money:
+
+      1. `rugged` already true. Cheapest possible answer and the only one that
+         needs no interpretation.
+      2. Liquidity below the floor. A pool you cannot exit is not an entry, and
+         the impact model already measures what "cannot exit" means: a $500
+         position into a $300 pool fills under 5% of itself.
+      3. LP neither burned nor locked. The deployer can withdraw at will.
+      4. The lock expires inside the holding horizon.
+
+    UNKNOWN IS NOT A REJECT, and it is not a pass either -- it is recorded as
+    unknown. At the cold start none of these fields exist (Part 2), and
+    rejecting on their absence would reject the entire market for the first few
+    minutes of every token's life while accepting on it would read empty as
+    clean, which Part 2 names the single most expensive mistake available here.
+    """
+    now = now or dt.datetime.now(tz=dt.UTC)
+    seen: dict[str, Any] = {}
+    #: Which of stage 3's fields were actually supplied. Counted rather than
+    #: inferred from `seen`, because `seen` also carries the "unknown" markers
+    #: and would otherwise never be empty -- making "unfetched" unreachable and
+    #: turning a token nobody looked at into one that passed three checks.
+    supplied = 0
+
+    if facts.get("rugged") is not None:
+        supplied += 1
+        seen["rugged"] = facts["rugged"]
+        if _truthy(facts["rugged"]):
+            return Verdict(False, 3, "already flagged rugged", seen)
+
+    liquidity = _number(facts.get("liquidity_usd"))
+    observed_at = _timestamp(facts.get("liquidity_observed_at"))
+    if observed_at is not None:
+        # A liquidity number is only as good as its timestamp. There is no age
+        # gate here -- 3.4 gives no number and inventing one would be a fiction
+        # -- but recording WHEN the reading was taken means a later calibration
+        # can ask whether stale readings decided anything.
+        seen["liquidity_observed_at"] = observed_at.isoformat()
+        seen["liquidity_age_seconds"] = int((now - observed_at).total_seconds())
+    if liquidity is None:
+        seen["liquidity_usd"] = "unknown"
+    else:
+        supplied += 1
+        seen["liquidity_usd"] = liquidity
+        if liquidity < min_liquidity_usd:
+            return Verdict(
+                False, 3,
+                f"liquidity ${liquidity:,.0f} below the ${min_liquidity_usd:,.0f} floor",
+                seen,
+            )
+
+    lp_state = facts.get("lp_state")
+    if lp_state is None:
+        seen["lp_state"] = "unknown"
+    else:
+        supplied += 1
+        seen["lp_state"] = lp_state
+        if str(lp_state).strip().lower() not in LP_SAFE_STATES:
+            return Verdict(False, 3, f"LP neither burned nor locked ({lp_state})", seen)
+
+    unlock = _timestamp(facts.get("lp_unlock_date"))
+    if unlock is None:
+        seen["lp_unlock_date"] = "unknown"
+    else:
+        supplied += 1
+        seen["lp_unlock_date"] = unlock.isoformat()
+        remaining = (unlock - now).total_seconds()
+        seen["lp_unlock_in_seconds"] = int(remaining)
+        if remaining <= 0:
+            return Verdict(False, 3, "LP lock has already expired", seen)
+        if remaining < hold_horizon_seconds:
+            # 3.4's free check. A lock expiring mid-hold is a countdown, and the
+            # deployer chose when it ends.
+            return Verdict(
+                False, 3,
+                f"LP unlocks in {remaining / 3600:.1f}h, inside the "
+                f"{hold_horizon_seconds / 3600:.0f}h holding horizon",
+                seen,
+            )
+
+    if supplied == 0:
+        return Verdict(True, 3, None, {"liquidity": "unfetched"})
+    return Verdict(True, 3, None, seen)
+
+
+def _number(value: Any) -> float | None:
+    """Parse a numeric field, or None. Never raises, never guesses a default."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(str(value).replace(",", "").replace("$", ""))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed == parsed and parsed not in (float("inf"), float("-inf")) else None
+
+
+def _timestamp(value: Any) -> dt.datetime | None:
+    if isinstance(value, dt.datetime):
+        return value if value.tzinfo else value.replace(tzinfo=dt.UTC)
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        seconds = value / 1000 if value > 10**11 else value
+        try:
+            return dt.datetime.fromtimestamp(seconds, tz=dt.UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.UTC)
+    return None
+
+
 def _truthy(value: Any) -> bool:
     """Vendor booleans arrive as 1/0, "1"/"0", true/false. All mean the same."""
     if isinstance(value, bool):
@@ -186,6 +331,8 @@ class Cascade:
 
     min_mints: int = DEFAULT_CREATOR_MIN_MINTS
     max_rug_rate: float = DEFAULT_CREATOR_MAX_RUG_RATE
+    min_liquidity_usd: float = DEFAULT_MIN_LIQUIDITY_USD
+    hold_horizon_seconds: int = DEFAULT_HOLD_HORIZON_SECONDS
 
     def thresholds(self) -> dict:
         """Snapshotted into every decision row (3.9.3).
@@ -197,7 +344,13 @@ class Cascade:
         return {
             "creator_min_mints": self.min_mints,
             "creator_max_rug_rate": self.max_rug_rate,
-            "stages": [0, 1, 2],
+            "min_liquidity_usd": self.min_liquidity_usd,
+            "hold_horizon_seconds": self.hold_horizon_seconds,
+            # Stage 3's numbers are 3.4 starting points, NOT measurements. Until
+            # they are tuned against matched controls they are assumptions, and
+            # recording that alongside them keeps a later calibration honest.
+            "calibrated": False,
+            "stages": [0, 1, 2, 3],
         }
 
     def run(self, facts: dict) -> tuple[Verdict, list[Verdict]]:
@@ -208,6 +361,10 @@ class Cascade:
             stage1_structural(facts),
             stage2_creator(
                 facts, min_mints=self.min_mints, max_rug_rate=self.max_rug_rate
+            ),
+            stage3_liquidity(
+                facts, min_liquidity_usd=self.min_liquidity_usd,
+                hold_horizon_seconds=self.hold_horizon_seconds,
             ),
         ):
             trail.append(verdict)
