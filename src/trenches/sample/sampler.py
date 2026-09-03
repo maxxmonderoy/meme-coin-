@@ -73,7 +73,7 @@ class Sampler:
         self._db = db
         # Cross-process budget: `label` may be running too, and the two must not
         # collectively exceed the account's 60 req/min.
-        self._budget = SharedBudget(db)
+        self._budget = SharedBudget.allocated(db, "sample")
         self._client = client or DexScreenerClient(shared_budget=self._budget)
         self._cadence = cadence
         self._max_age = max_age_seconds

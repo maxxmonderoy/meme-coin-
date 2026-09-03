@@ -846,6 +846,49 @@ async def cmd_replay_exits(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_backup(cfg: Config, args: argparse.Namespace) -> int:
+    """Write a verified copy of the collected database.
+
+    The journal is the only artefact here that cannot be rebuilt: an
+    observation not taken today cannot be taken later. Safe to run while the
+    collectors are writing.
+    """
+    from pathlib import Path
+
+    from .db.backup import BackupError, backup_sqlite, prune_backups
+    from .db.dialect import POSTGRES, detect_dialect
+
+    if detect_dialect(cfg.dsn) == POSTGRES:
+        print("this command backs up SQLite only. For Postgres use pg_dump, which "
+              "your server already ships:", file=sys.stderr)
+        print("  pg_dump --format=custom --file=trenches-$(date +%%Y%%m%%d).dump <dsn>",
+              file=sys.stderr)
+        return 2
+
+    try:
+        report = backup_sqlite(cfg.dsn, Path(args.to) if args.to else None)
+    except BackupError as exc:
+        print(f"backup failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"wrote {report.path}  ({report.megabytes:,.1f} MB)")
+    for table, count in sorted(report.counts.items()):
+        print(f"  {table:<20}{count:>12,}")
+    if report.verified:
+        print("\n  row counts match the source and integrity_check passed")
+    else:
+        print(f"\n  ** ROW COUNTS DIFFER: {report.mismatches}", file=sys.stderr)
+        print("  Treat this copy as suspect.", file=sys.stderr)
+        return 1
+
+    if args.keep:
+        removed = prune_backups(report.path.parent, keep=args.keep,
+                                prefix=report.path.name.split("-")[0])
+        if removed:
+            print(f"  pruned {len(removed)} older backup(s), keeping {args.keep}")
+    return 0
+
+
 async def cmd_idl_check(cfg: Config, args: argparse.Namespace) -> int:
     from .decode import idl, idl_check
 
@@ -1308,6 +1351,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="position size in USD; compared against pool liquidity")
     replay.add_argument("--limit", type=int, default=5000)
 
+    backup = sub.add_parser(
+        "backup", help="verified copy of the collected database (safe while running)")
+    backup.add_argument("--to", default=None, help="destination path")
+    backup.add_argument("--keep", type=int, default=0,
+                        help="delete all but the newest N backups in that directory")
+
     sub.add_parser("idl-check", help="diff the vendored IDL against upstream")
     sub.add_parser("prune", help="delete raw_events past the retention window")
     return parser
@@ -1320,6 +1369,7 @@ HANDLERS = {
     "structural": cmd_structural,
     "exits": cmd_exits,
     "sample": cmd_sample,
+    "backup": cmd_backup,
     "replay-exits": cmd_replay_exits,
     "idl-check": cmd_idl_check, "prune": cmd_prune,
     "label": cmd_label, "rules-report": cmd_rules_report, "gate": cmd_gate,

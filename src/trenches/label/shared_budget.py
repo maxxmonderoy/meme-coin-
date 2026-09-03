@@ -29,6 +29,57 @@ log = get(__name__)
 #: Name of the budget every DexScreener caller shares.
 DEXSCREENER = "dexscreener"
 
+#: ALLOCATION, not just a ceiling.
+#:
+#: A single shared bucket prevents a ban but not starvation: whichever collector
+#: asks most often wins, and the labeler at a high batch limit will consume
+#: nearly the whole 60 req/min and leave the sampler a fraction of the budget
+#: its own cadence arithmetic assumes. Measured: a labeler at 1,200 mints/min
+#: takes 48 of 60 req/min on its own.
+#:
+#: So each collector gets a NAMED share with a guaranteed floor. The shares are
+#: validated to sum within the account limit, which turns a silent contention
+#: bug into a startup error.
+ACCOUNT_LIMIT_PER_MINUTE = 60
+
+DEFAULT_SHARES: dict[str, float] = {
+    # Depth: dense paths on a bounded watch set. Given the larger share because
+    # a trailing stop cannot be backtested on four data points, and the exit
+    # work is what the paths exist for.
+    "sample": 0.65,
+    # Breadth: one poll per horizon across every mint. Still useful for rug
+    # labelling over the whole market rather than the sampled slice.
+    "label": 0.35,
+}
+
+
+class BudgetAllocationError(ValueError):
+    pass
+
+
+def validate_shares(shares: dict[str, float], *, limit: int = ACCOUNT_LIMIT_PER_MINUTE
+                    ) -> dict[str, int]:
+    """Turn shares into per-collector request rates, or refuse.
+
+    Refusing is the point: two collectors quietly over-subscribing an account
+    limit is exactly the failure that has no symptom until the ban.
+    """
+    if not shares:
+        raise BudgetAllocationError("no shares given")
+    total = sum(shares.values())
+    if total > 1.0 + 1e-9:
+        raise BudgetAllocationError(
+            f"shares sum to {total:.2f}, which over-subscribes the {limit} req/min "
+            "account limit. Collectors would contend and the loser would silently "
+            "run below the rate its own arithmetic assumes."
+        )
+    rates = {name: int(limit * share) for name, share in shares.items()}
+    for name, rate in rates.items():
+        if rate < 1:
+            raise BudgetAllocationError(
+                f"share for {name!r} rounds to 0 req/min; it would never run")
+    return rates
+
 #: Burst allowance. One second's worth, so a batch of callers starting together
 #: does not immediately exceed the per-minute rate.
 DEFAULT_CAPACITY_SECONDS = 1.0
@@ -40,7 +91,7 @@ class SharedBudget:
         db: Database,
         *,
         name: str = DEXSCREENER,
-        rate_per_minute: int = 60,
+        rate_per_minute: int = ACCOUNT_LIMIT_PER_MINUTE,
         capacity_seconds: float = DEFAULT_CAPACITY_SECONDS,
         max_wait_seconds: float = 30.0,
     ) -> None:
@@ -49,6 +100,23 @@ class SharedBudget:
         self._rate = float(rate_per_minute)
         self._capacity = max(1.0, self._rate * capacity_seconds / 60.0)
         self._max_wait = max_wait_seconds
+
+    @classmethod
+    def allocated(
+        cls, db: Database, collector: str, *, shares: dict[str, float] | None = None,
+        limit: int = ACCOUNT_LIMIT_PER_MINUTE,
+    ) -> SharedBudget:
+        """A budget for one named collector, holding a guaranteed share.
+
+        Each collector gets its own row, so a busy one cannot spend another's
+        allowance. The shares are validated against the account limit up front.
+        """
+        rates = validate_shares(shares or DEFAULT_SHARES, limit=limit)
+        if collector not in rates:
+            raise BudgetAllocationError(
+                f"no share allocated for {collector!r}; known: {sorted(rates)}")
+        return cls(db, name=f"{DEXSCREENER}:{collector}",
+                   rate_per_minute=rates[collector])
 
     async def ensure(self) -> None:
         """Create the row if it is missing. Safe to call concurrently."""

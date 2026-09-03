@@ -65,8 +65,27 @@ trenches decide                      # run the cascade, journal every verdict
 trenches paper                       # the paper journal and §3.9.6 progress
 trenches replay-exits                # compare exit rulesets, split by cohort
 trenches sample --compact            # downsample expired paths
+trenches backup --keep 7             # verified copy; the journal cannot be rebuilt
 trenches verify-capture captures/    # confirm the PumpPortal frame schema
 ```
+
+**Back up the database.** Everything else here is code and code is reversible.
+The journal is a record of tokens that launched at a particular moment, and
+nobody else stores what happened to them -- an observation not taken today
+cannot be taken later, so losing the file costs calendar time rather than
+developer time. `trenches backup` is safe to run while the collectors are
+writing (it uses `VACUUM INTO`, not a file copy, which is the classic way to get
+a backup that restores to a corrupt database), and it verifies row counts and
+runs an integrity check on the copy.
+
+**Running `label` and `sample` together splits one 60 req/min budget.** They
+hold guaranteed shares rather than contending -- 65% to `sample`, 35% to
+`label` -- because a single shared bucket prevents a ban but not starvation: at
+a high batch limit the labeler alone takes 48 of 60 req/min. The two collect
+different things and the choice is real: `label` covers 100% of launches with
+four data points each, `sample` covers ~18% with a point every 30 seconds. A
+trailing stop cannot be backtested on four points, so the exit work needs
+`sample`.
 
 Start with `trenches sample --once` rather than `trenches sample`: it prints what
 it admitted and what it observed, and tells you what is missing if the answer is

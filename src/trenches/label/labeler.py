@@ -79,7 +79,7 @@ class Labeler:
     ) -> None:
         self._db = db
         # Cross-process budget: `sample` may be running too.
-        self._budget = SharedBudget(db)
+        self._budget = SharedBudget.allocated(db, "label")
         self._client = client or DexScreenerClient(shared_budget=self._budget)
         #: Fallback only. DexScreener saying nothing is ambiguous for a young
         #: mint, so before concluding 'no pool' we ask a second free source.

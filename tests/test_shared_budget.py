@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import datetime as dt
 
+import pytest
+
 from trenches.label.shared_budget import SharedBudget
 from trenches.sample import derive as derive_mod
 
@@ -225,3 +227,120 @@ async def test_unique_detection_rate_is_not_the_sum_of_feed_sightings(any_db):
     rate = await repo.unique_detection_rate(any_db, hours=1)
     assert rate["unique_mints"] == 5          # not 10
     assert await any_db.fetchval("select count(*) from raw_events") == 10
+
+
+# -- allocation, not just a ceiling ---------------------------------------
+
+def test_shares_are_validated_against_the_account_limit():
+    """Two collectors quietly over-subscribing a limit is the failure with no
+    symptom until the ban. Refusing at startup is the point."""
+    from trenches.label.shared_budget import BudgetAllocationError, validate_shares
+
+    assert validate_shares({"sample": 0.65, "label": 0.35}) == {"sample": 39, "label": 21}
+    with pytest.raises(BudgetAllocationError, match="over-subscribes"):
+        validate_shares({"sample": 0.8, "label": 0.5})
+
+
+def test_a_share_that_rounds_to_nothing_is_refused():
+    from trenches.label.shared_budget import BudgetAllocationError, validate_shares
+
+    with pytest.raises(BudgetAllocationError, match="never run"):
+        validate_shares({"sample": 0.999, "label": 0.001})
+
+
+async def test_one_collector_cannot_spend_anothers_allowance(any_db):
+    """A single shared bucket prevents a ban but not starvation: whichever
+    collector asks most often wins. Measured, a labeler at 1,200 mints/min takes
+    48 of 60 req/min on its own and leaves the sampler a fraction of the budget
+    its cadence arithmetic assumes."""
+    from trenches.label.shared_budget import SharedBudget
+
+    sample = SharedBudget.allocated(any_db, "sample")
+    label = SharedBudget.allocated(any_db, "label")
+    await sample.ensure()
+    await label.ensure()
+
+    # Drain the labeler's allowance completely at a frozen clock.
+    while await label.try_acquire(now=T0):
+        pass
+    assert await label.try_acquire(now=T0) is False
+
+    # The sampler's share is untouched.
+    assert await sample.try_acquire(now=T0) is True
+
+
+async def test_each_collector_gets_its_own_row(any_db):
+    from trenches.label.shared_budget import SharedBudget
+
+    await SharedBudget.allocated(any_db, "sample").ensure()
+    await SharedBudget.allocated(any_db, "label").ensure()
+    names = {r["name"] for r in await any_db.fetch("select name from rate_budget")}
+    assert names == {"dexscreener:sample", "dexscreener:label"}
+
+
+async def test_allocated_rates_sum_within_the_account_limit(any_db):
+    from trenches.label.shared_budget import ACCOUNT_LIMIT_PER_MINUTE, SharedBudget
+
+    for collector in ("sample", "label"):
+        await SharedBudget.allocated(any_db, collector).ensure()
+    total = sum(float(r["rate_per_minute"])
+                for r in await any_db.fetch("select rate_per_minute from rate_budget"))
+    assert total <= ACCOUNT_LIMIT_PER_MINUTE
+
+
+# -- backups ---------------------------------------------------------------
+
+def test_backup_produces_a_verified_copy(tmp_path):
+    """A backup nobody checks is a belief, not a backup."""
+    import sqlite3
+
+    from trenches.db.backup import backup_sqlite
+
+    source = tmp_path / "live.db"
+    conn = sqlite3.connect(source)
+    conn.execute("create table tokens_seen (mint text primary key)")
+    conn.executemany("insert into tokens_seen values (?)", [(f"M{i}",) for i in range(500)])
+    conn.commit()
+    conn.close()
+
+    report = backup_sqlite(f"sqlite://{source}", tmp_path / "copy.db")
+    assert report.verified is True
+    assert report.counts["tokens_seen"] == 500
+    assert report.path.exists()
+
+
+def test_backup_refuses_to_overwrite_an_existing_backup(tmp_path):
+    import sqlite3
+
+    from trenches.db.backup import BackupError, backup_sqlite
+
+    source = tmp_path / "live.db"
+    sqlite3.connect(source).close()
+    target = tmp_path / "copy.db"
+    target.write_text("not a database")
+    with pytest.raises(BackupError, match="refusing to overwrite"):
+        backup_sqlite(f"sqlite://{source}", target)
+
+
+def test_backup_refuses_a_missing_database(tmp_path):
+    from trenches.db.backup import BackupError, backup_sqlite
+
+    with pytest.raises(BackupError, match="no database"):
+        backup_sqlite(f"sqlite://{tmp_path}/nope.db")
+
+
+def test_pruning_keeps_the_newest_and_never_the_live_file(tmp_path):
+    import time
+
+    from trenches.db.backup import prune_backups
+
+    live = tmp_path / "trenches.db"
+    live.write_text("live")
+    for i in range(5):
+        (tmp_path / f"trenches-2026090{i}.db").write_text("x")
+        time.sleep(0.01)
+
+    removed = prune_backups(tmp_path, keep=2, prefix="trenches")
+    assert len(removed) == 3
+    assert live.exists()                       # the live database is never touched
+    assert len(list(tmp_path.glob("trenches-*.db"))) == 2
