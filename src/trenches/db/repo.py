@@ -153,24 +153,64 @@ async def record_second_sight(
     )
 
 
-async def feed_race_summary(db: Database, hours: float = 24) -> list[dict]:
+async def feed_race_summary(db: Database, hours: float = 24) -> dict:
+    """Who saw each mint first, split into CONTESTED and SOLE sightings.
+
+    Reporting a single "wins" count mixes two different populations and invites
+    a conclusion the data does not support. Measured live: one feed won 62.5% of
+    mints, which reads as "somewhat faster" -- but every one of the other feed's
+    730 "wins" had no second sighting at all, meaning the first feed never
+    delivered those launches. The true statement was that it won 100% of races
+    it was actually in, and missed 37.5% of launches outright.
+
+    Those are different facts with different consequences. One is about latency,
+    the other about coverage, and only the split tells you which feed you could
+    drop and what it would cost.
+    """
+    cutoff = _cutoff(hours)
     rows = await db.fetch(
-        "select first_feed, count(*) as wins from feed_latency "
-        "where first_seen_at >= ? group by first_feed order by wins desc",
-        _cutoff(hours),
+        "select first_feed, count(*) as sightings from feed_latency "
+        "where first_seen_at >= ? group by first_feed order by sightings desc",
+        cutoff,
     )
     deltas = await db.fetch(
         "select first_feed, delta_ms from feed_latency "
         "where first_seen_at >= ? and delta_ms is not null",
-        _cutoff(hours),
+        cutoff,
+    )
+    seconds = await db.fetch(
+        "select second_feed, count(*) as n from feed_latency "
+        "where first_seen_at >= ? and second_feed is not null group by second_feed",
+        cutoff,
     )
     by_feed: dict[str, list[int]] = {}
     for row in deltas:
         by_feed.setdefault(row["first_feed"], []).append(int(row["delta_ms"]))
+    seen_second = {r["second_feed"]: int(r["n"]) for r in seconds}
+
+    total = sum(int(r["sightings"]) for r in rows)
+    contested = len(deltas)
+    out = []
     for row in rows:
-        row["delta_ms"] = percentiles(by_feed.get(row["first_feed"], []))
-        row["both_saw"] = len(by_feed.get(row["first_feed"], []))
-    return rows
+        feed = row["first_feed"]
+        wins = int(row["sightings"])
+        won_contested = len(by_feed.get(feed, []))
+        out.append({
+            "feed": feed,
+            "first_sightings": wins,
+            # Races this feed was actually IN: ones it won head-to-head, plus
+            # ones another feed beat it to.
+            "contested_wins": won_contested,
+            "contested_losses": seen_second.get(feed, 0),
+            "sole_sightings": wins - won_contested,
+            "delta_ms": percentiles(by_feed.get(feed, [])),
+        })
+    for row in out:
+        races = row["contested_wins"] + row["contested_losses"]
+        row["contested_win_rate"] = (row["contested_wins"] / races) if races else None
+        row["sole_share"] = (row["sole_sightings"] / total) if total else 0.0
+    return {"feeds": out, "mints": total, "contested": contested,
+            "sole": total - contested}
 
 
 # -- creators --------------------------------------------------------------

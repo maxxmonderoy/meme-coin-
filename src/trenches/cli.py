@@ -293,18 +293,32 @@ async def cmd_stats(cfg: Config, args: argparse.Namespace) -> int:
             print(f"    lateness           p50 {lateness.get('p50')}ms "
                   f"p90 {lateness.get('p90')}ms")
 
-    race = data.get("feed_race") or []
-    if race:
-        total = sum(int(r["wins"]) for r in race) or 1
-        print("\n  FEED RACE -- who saw each mint first (3.2 upgrade trigger 2 evidence):")
-        for row in race:
-            wins = int(row["wins"])
+    race = data.get("feed_race") or {}
+    feeds = race.get("feeds") or []
+    if feeds:
+        mints = race.get("mints") or 0
+        print(f"\n  FEED RACE over {mints:,} mint(s) "
+              f"-- {race.get('contested', 0):,} contested, {race.get('sole', 0):,} "
+              "seen by one feed only")
+        print("    (3.2 upgrade trigger 2 evidence)")
+        for row in feeds:
             d = row.get("delta_ms") or {}
-            lead = (f"lead over the other feed: p50 {d.get('p50')}ms p90 {d.get('p90')}ms"
-                    if d else "no head-to-head samples yet")
-            print(f"    {row['first_feed']:<14} {wins:>7,} wins ({wins / total:>5.1%})  {lead}")
-        print("\n  Read this before ever paying for a faster feed: a feed that never wins,")
-        print("  or wins by milliseconds you cannot act on, is not worth upgrading.")
+            rate = row.get("contested_win_rate")
+            print(f"    {row['feed']:<14} first on {row['first_sightings']:>7,} mint(s)")
+            if rate is not None:
+                print(f"      contested      won {row['contested_wins']:>7,} of "
+                      f"{row['contested_wins'] + row['contested_losses']:,} "
+                      f"({rate:.0%})"
+                      + (f"  lead p50 {d.get('p50')}ms p90 {d.get('p90')}ms" if d else ""))
+            if row["sole_sightings"]:
+                print(f"      SOLE           {row['sole_sightings']:>7,} mint(s) "
+                      f"({row['sole_share']:.0%} of all) no other feed ever "
+                      "delivered")
+        print("\n  Read the two lines separately. A contested win rate is about LATENCY;")
+        print("  sole sightings are about COVERAGE, and a feed that contributes mostly")
+        print("  sole sightings cannot be dropped no matter how slow it is. Before")
+        print("  paying for a faster feed, check that the one you have is losing races")
+        print("  it actually entered -- not simply missing launches.")
 
     total_rows = sum(v["observed"] for v in coverage["horizons"].values())
     print(f"\n  OUTCOME LABELING -- {total_rows:,} observations over "

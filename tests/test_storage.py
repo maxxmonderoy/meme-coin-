@@ -150,21 +150,64 @@ async def test_the_same_feed_reporting_twice_is_not_a_race_result(any_db):
     assert row["second_feed"] is None
 
 
-async def test_race_summary_reports_wins_per_feed(any_db):
+async def test_race_summary_separates_contested_wins_from_sole_sightings(any_db):
+    """The distinction that changes what you would do about it.
+
+    Measured live, one feed was "first" on 62.5% of mints, which reads as
+    somewhat faster. But every one of the other feed's wins had no second
+    sighting, meaning the first feed never delivered those launches at all. The
+    true statement was that it won 100% of the races it entered and missed 37.5%
+    of launches -- a latency fact and a coverage fact, with different
+    consequences, that a single "wins" count welds into one misleading number.
+    """
     sid = await repo.open_stream(any_db, feeds=["a"], subscription={}, code_version="v")
     now = dt.datetime.now(tz=dt.UTC)
+
+    # Three mints both feeds saw; pumpportal first each time, 500ms ahead.
     for i in range(3):
         await repo.record_first_sight(any_db, mint=f"P{i}", feed="pumpportal",
                                       seen_at=now, stream_id=sid)
         await repo.record_second_sight(any_db, mint=f"P{i}", feed="rugcheck",
                                        seen_at=now + dt.timedelta(milliseconds=500))
-    await repo.record_first_sight(any_db, mint="R0", feed="rugcheck",
-                                  seen_at=now, stream_id=sid)
+    # Two mints ONLY rugcheck ever delivered.
+    for i in range(2):
+        await repo.record_first_sight(any_db, mint=f"R{i}", feed="rugcheck",
+                                      seen_at=now, stream_id=sid)
 
-    summary = {r["first_feed"]: r for r in await repo.feed_race_summary(any_db)}
-    assert summary["pumpportal"]["wins"] == 3
-    assert summary["rugcheck"]["wins"] == 1
-    assert summary["pumpportal"]["delta_ms"]["p50"] == 500
+    summary = await repo.feed_race_summary(any_db)
+    by_feed = {row["feed"]: row for row in summary["feeds"]}
+
+    assert summary["mints"] == 5
+    assert summary["contested"] == 3
+    assert summary["sole"] == 2
+
+    pp = by_feed["pumpportal"]
+    assert pp["contested_wins"] == 3
+    assert pp["contested_losses"] == 0
+    assert pp["contested_win_rate"] == 1.0        # won every race it entered
+    assert pp["sole_sightings"] == 0
+    assert pp["delta_ms"]["p50"] == 500
+
+    rc = by_feed["rugcheck"]
+    assert rc["first_sightings"] == 2
+    assert rc["contested_wins"] == 0              # never beat the other feed
+    assert rc["contested_losses"] == 3            # it was second three times
+    assert rc["sole_sightings"] == 2              # but it alone delivered these
+    assert rc["sole_share"] == 0.4
+
+
+async def test_a_feed_that_only_ever_arrives_second_still_shows_its_races(any_db):
+    """Losing a race is different from not being in one."""
+    sid = await repo.open_stream(any_db, feeds=["a"], subscription={}, code_version="v")
+    now = dt.datetime.now(tz=dt.UTC)
+    await repo.record_first_sight(any_db, mint="M", feed="pumpportal",
+                                  seen_at=now, stream_id=sid)
+    await repo.record_second_sight(any_db, mint="M", feed="rugcheck",
+                                   seen_at=now + dt.timedelta(seconds=2))
+
+    by_feed = {r["feed"]: r for r in (await repo.feed_race_summary(any_db))["feeds"]}
+    assert "rugcheck" not in by_feed or by_feed["rugcheck"]["first_sightings"] == 0
+    assert by_feed["pumpportal"]["contested_win_rate"] == 1.0
 
 
 # -- health and the decisions gate -----------------------------------------
