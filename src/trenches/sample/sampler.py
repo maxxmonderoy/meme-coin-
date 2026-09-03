@@ -21,6 +21,7 @@ from ..db import repo
 from ..db.dialect import Database
 from ..label import venues
 from ..label.dexscreener import BATCH_SIZE, RATE_LIMIT_PER_MINUTE, DexScreenerClient
+from ..label.shared_budget import SharedBudget
 from ..log import get, kv
 from .cadence import (
     DEFAULT_CADENCE,
@@ -66,9 +67,14 @@ class Sampler:
         control_share: float = 0.5,
         batch_size: int = BATCH_SIZE,
         requests_per_minute: int = RATE_LIMIT_PER_MINUTE,
+        derive_outcomes: bool = True,
+        derive_limit: int = 1000,
     ) -> None:
         self._db = db
-        self._client = client or DexScreenerClient()
+        # Cross-process budget: `label` may be running too, and the two must not
+        # collectively exceed the account's 60 req/min.
+        self._budget = SharedBudget(db)
+        self._client = client or DexScreenerClient(shared_budget=self._budget)
         self._cadence = cadence
         self._max_age = max_age_seconds
         self.budget: Budget = compute_budget(
@@ -80,6 +86,8 @@ class Sampler:
         )
         self.observations = 0
         self.admitted = 0
+        self._derive_outcomes = derive_outcomes
+        self._derive_limit = derive_limit
 
     def log_budget(self) -> None:
         for line in describe(self.budget):
@@ -230,11 +238,18 @@ class Sampler:
     ) -> None:
         """Loop until cancelled. Never raises into the caller."""
         self.log_budget()
+        await self._budget.ensure()
         last_heartbeat = 0.0
         while True:
             try:
                 admitted = await self.backfill_admissions()
                 report = await self.tick()
+                # Project the path onto outcome horizons so `label` is not
+                # needed as a second collector competing for the same budget.
+                if self._derive_outcomes:
+                    from .derive import derive_all
+
+                    await derive_all(self._db, limit=self._derive_limit)
                 if report["observed"] or admitted["admitted"]:
                     kv(log, logging.INFO, "sampled", **report,
                        admitted=admitted["admitted"], cohorts=admitted["by_cohort"])

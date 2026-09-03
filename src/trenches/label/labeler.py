@@ -25,6 +25,7 @@ from ..enrich.rugcheck import RugCheckClient
 from ..log import get, kv
 from . import HORIZON_SECONDS, HORIZONS
 from .dexscreener import BATCH_SIZE, DexScreenerClient
+from .shared_budget import SharedBudget
 from .venues import DEX, NONE, classify_markets, dex_liquidity_usd
 
 log = get(__name__)
@@ -77,7 +78,9 @@ class Labeler:
         backfill: bool = False,
     ) -> None:
         self._db = db
-        self._client = client or DexScreenerClient()
+        # Cross-process budget: `sample` may be running too.
+        self._budget = SharedBudget(db)
+        self._client = client or DexScreenerClient(shared_budget=self._budget)
         #: Fallback only. DexScreener saying nothing is ambiguous for a young
         #: mint, so before concluding 'no pool' we ask a second free source.
         self._rugcheck = rugcheck

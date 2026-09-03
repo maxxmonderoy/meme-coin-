@@ -232,13 +232,26 @@ class DexScreenerClient:
         chain: str = "solana",
         timeout: float = 20.0,
         bucket: TokenBucket | None = None,
+        shared_budget=None,
     ) -> None:
+        """`shared_budget` is a cross-PROCESS limiter (see shared_budget.py).
+
+        Pass one whenever more than one collector may run at once. `label` and
+        `sample` are separate processes, so an in-process TokenBucket alone lets
+        them reach 120 req/min against a documented 60 -- and DexScreener sends
+        no rate-limit headers, so the first symptom is a ban.
+
+        Both limiters apply when both are present: the in-process bucket
+        smooths bursts within this process, the shared one enforces the account
+        budget across all of them.
+        """
         self._base = base_url.rstrip("/")
         self._chain = chain
         self._timeout = timeout
         #: Shared across every endpoint this client touches -- the published
         #: 60/min is an account-wide budget, not a per-endpoint one.
         self.bucket = bucket or TokenBucket()
+        self.shared_budget = shared_budget
 
     async def tokens(self, mints: list[str]) -> BatchResult:
         """Look up up to BATCH_SIZE mints in one request."""
@@ -247,6 +260,8 @@ class DexScreenerClient:
                 f"batch of {len(mints)} exceeds BATCH_SIZE={BATCH_SIZE}; chunk before calling"
             )
         url = f"{self._base}/tokens/v1/{self._chain}/{','.join(mints)}"
+        if self.shared_budget is not None:
+            await self.shared_budget.acquire()
         await self.bucket.acquire()
         started = time.monotonic()
         try:

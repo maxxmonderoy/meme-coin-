@@ -659,6 +659,8 @@ async def cmd_sample(cfg: Config, args: argparse.Namespace) -> int:
             db, cadence=DEFAULT_CADENCE,
             max_age_seconds=int(args.max_age_hours * 3600),
             control_share=args.control_share,
+            derive_outcomes=args.derive_outcomes,
+            derive_limit=args.derive_limit,
         )
         for line in describe(sampler.budget):
             print(f"  {line}")
@@ -672,6 +674,18 @@ async def cmd_sample(cfg: Config, args: argparse.Namespace) -> int:
                   f"({report.removed:,} removed)")
             print("  extremes are always kept: a trailing stop is a function of peaks")
             print("  and the falls from them, so dropping one would change a replay")
+            return 0
+        if args.derive_only:
+            from .sample.derive import derive_all
+
+            report = await derive_all(db, limit=args.derive_limit)
+            print(f"\n  derived {report.written} outcome row(s) across "
+                  f"{report.mints} mint(s) {report.by_horizon}")
+            print(f"  {report.skipped_no_observation} mint(s) had no observation near "
+                  "any checkpoint")
+            print("\n  Derived rows are marked backfilled with source=price_path and")
+            print("  carry their offset from the checkpoint, so a 30-second-off sample")
+            print("  and a two-hour-late poll stay distinguishable.")
             return 0
         if args.once:
             admitted = await sampler.backfill_admissions()
@@ -1242,6 +1256,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="downsample expired paths instead of sampling")
     sample.add_argument("--compact-after-hours", type=float, default=24.0,
                         dest="compact_after_hours")
+    sample.add_argument("--derive-only", action="store_true", dest="derive_only",
+                        help="project collected paths onto outcome horizons and exit")
+    sample.add_argument("--no-derive", action="store_false", dest="derive_outcomes",
+                        default=True,
+                        help="do not derive outcomes while sampling (leaves that to "
+                             "`trenches label`, which competes for the same budget)")
+    sample.add_argument("--derive-limit", type=int, default=1000, dest="derive_limit")
 
     replay = sub.add_parser("replay-exits",
                             help="replay exit rulesets over collected paths, by cohort")

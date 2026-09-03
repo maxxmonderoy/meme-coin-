@@ -20,6 +20,11 @@ def _now() -> dt.datetime:
     return dt.datetime.now(tz=dt.UTC)
 
 
+def _as_iso(value) -> str | None:
+    """Accept a datetime or an already-ISO string; always store text."""
+    return iso(value) if isinstance(value, dt.datetime) else value
+
+
 def _cutoff(hours: float) -> str:
     return iso(_now() - dt.timedelta(hours=hours))
 
@@ -368,7 +373,11 @@ async def record_outcome(db: Database, *, mint: str, horizon: str, fields: dict)
         "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
         "        ?, ?, ?, ?, ?, ?, ?) "
         "on conflict (mint, horizon) do nothing",
-        mint, horizon, fields["scheduled_for"], fields["observed_at"],
+        # Normalised rather than passed through. SQLite silently coerces a
+        # datetime to text; asyncpg raises. Accepting both here means a caller
+        # cannot write rows that work on one engine and fail on the other --
+        # which is exactly how this was found.
+        mint, horizon, _as_iso(fields["scheduled_for"]), _as_iso(fields["observed_at"]),
         fields.get("lateness_seconds", 0), fields["status"],
         1 if fields.get("ambiguous_no_pool") else 0,
         1 if fields.get("backfilled") else 0,
