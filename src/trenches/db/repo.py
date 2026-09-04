@@ -668,6 +668,11 @@ async def candidates_for_decision(db: Database, *, limit: int = 5000) -> list[di
     from a clean result, because reading empty as clean is Part 2's most
     expensive mistake.
 
+    `detected_at`, `bonding_curve` and the latest `pair_address` are here for
+    stage 4: it cannot believe a zero on a mint too young to have one (Part 2),
+    and it must exclude the curve and pool addresses or it rejects on the curve
+    itself.
+
     STAGE 3 IS ONLY HALF SUPPLIED HERE, and the missing half is named rather
     than guessed. `liquidity_usd` and `rugged` have verified sources in this
     repo: DexScreener's `liquidity.usd` (see `label/dexscreener.py`) and
@@ -676,10 +681,17 @@ async def candidates_for_decision(db: Database, *, limit: int = 5000) -> list[di
     RugCheck report carries the locker's `unlockDate`, so those stay absent and
     stage 3 records them as unknown. Part 0 rule 2: a plausible-sounding field
     path is worse than a gap.
+
+    STAGE 4 HAS NO SUPPLIER AT ALL beyond those exclusions. Dev share, sniper,
+    insider and bundler counts and the holder list are all behavioural fields
+    with a cold start (Part 2), and none of them is collected by anything in
+    this repo yet, so stage 4 journals `unfetched`. It is wired, tested and
+    thresholded so it starts working the day a supplier lands -- and until then
+    the journal says it did nothing rather than implying it passed.
     """
     return await db.fetch(
         "select t.mint, t.signer, t.declared_creator, t.launchpad, t.symbol, "
-        "       t.is_mayhem_mode, t.stream_id, "
+        "       t.is_mayhem_mode, t.stream_id, t.detected_at, t.bonding_curve, "
         "       c.n_mints as creator_n_mints, c.n_rugged as creator_n_rugged, "
         "       s.mintable, s.freezable, s.closable, s.balance_mutable_authority, "
         "       s.transfer_fee_upgradable, s.transfer_hook_upgradable, "
@@ -697,7 +709,12 @@ async def candidates_for_decision(db: Database, *, limit: int = 5000) -> list[di
         "          order by p.observed_at desc limit 1) as liquidity_observed_at, "
         "       (select 1 from structural_events e "
         "          where e.mint = t.mint and e.event_type = 'rugged' "
-        "          limit 1) as rugged "
+        "          limit 1) as rugged, "
+        # Stage 4 must exclude the curve and the pool or it rejects on the
+        # bonding curve itself, which holds essentially the whole supply.
+        "       (select p.pair_address from price_path p "
+        "          where p.mint = t.mint and p.pair_address is not null "
+        "          order by p.observed_at desc limit 1) as pair_address "
         "from tokens_seen t "
         "left join creators c on c.address = t.signer and c.role = 'signer' "
         "left join token_structural s on s.mint = t.mint "

@@ -93,6 +93,12 @@ class Config:
     decide_creator_max_rug_rate: float
     decide_min_liquidity_usd: float
     decide_hold_horizon_seconds: int
+    decide_max_dev_pct: float
+    decide_max_snipers: int
+    decide_max_insiders: int
+    decide_max_bundler_pct: float
+    decide_max_bundler_count: int
+    decide_cold_start_seconds: int
     log_level: str = field(default="INFO")
 
     @staticmethod
@@ -157,6 +163,15 @@ class Config:
             # `thresholds()` snapshots whatever it ends up being into every row.
             decide_min_liquidity_usd=_get_float("TRENCHES_DECIDE_MIN_LIQUIDITY_USD", 5000.0),
             decide_hold_horizon_seconds=_get_int("TRENCHES_DECIDE_HOLD_HORIZON_SECONDS", 6 * 3600),
+            # Stage 4. These five ARE 3.4's stated numbers, unlike the floor above.
+            decide_max_dev_pct=_get_float("TRENCHES_DECIDE_MAX_DEV_PCT", 5.0),
+            decide_max_snipers=_get_int("TRENCHES_DECIDE_MAX_SNIPERS", 20),
+            decide_max_insiders=_get_int("TRENCHES_DECIDE_MAX_INSIDERS", 20),
+            decide_max_bundler_pct=_get_float("TRENCHES_DECIDE_MAX_BUNDLER_PCT", 15.0),
+            decide_max_bundler_count=_get_int("TRENCHES_DECIDE_MAX_BUNDLER_COUNT", 100),
+            # Below this age a behavioural zero is a cold start, not a clean
+            # result, and every stage-4 rule passes on zero (Part 2).
+            decide_cold_start_seconds=_get_int("TRENCHES_DECIDE_COLD_START_SECONDS", 600),
             log_level=_get("TRENCHES_LOG_LEVEL", "INFO"),
         )
         if cfg.workers < 1:

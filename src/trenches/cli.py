@@ -1097,13 +1097,19 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
     """
     import time
 
-    from .decide import Cascade
+    from .decide import UNSUPPLIED, Cascade, facts_from_row, missing_from
 
     cascade = Cascade(
         min_mints=cfg.decide_creator_min_mints,
         max_rug_rate=cfg.decide_creator_max_rug_rate,
         min_liquidity_usd=cfg.decide_min_liquidity_usd,
         hold_horizon_seconds=cfg.decide_hold_horizon_seconds,
+        max_dev_pct=cfg.decide_max_dev_pct,
+        max_snipers=cfg.decide_max_snipers,
+        max_insiders=cfg.decide_max_insiders,
+        max_bundler_pct=cfg.decide_max_bundler_pct,
+        max_bundler_count=cfg.decide_max_bundler_count,
+        cold_start_seconds=cfg.decide_cold_start_seconds,
     )
     thresholds = cascade.thresholds()
     version = code_version()
@@ -1115,9 +1121,18 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
             print("no undecided candidates")
             return 0
         accepted = rejected = 0
+        #: An accept is not one thing. A candidate that passed a stage on real
+        #: data and one that passed it because nothing was fetched are opposite
+        #: facts, and a headline "accept" count that merges them is the number
+        #: that later gets mistaken for a filter working.
+        cold_start = unfetched = 0
+        gaps: dict[str, int] = {}
         for row in rows:
             started = time.perf_counter()
-            verdict, trail = cascade.run(dict(row))
+            facts = facts_from_row(row)
+            for key in missing_from(facts):
+                gaps[key] = gaps.get(key, 0) + 1
+            verdict, trail = cascade.run(facts)
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             await repo.record_decision(db, mint=row["mint"], fields={
                 "stream_id": row.get("stream_id"),
@@ -1135,6 +1150,9 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
                 rejected += 1
             else:
                 accepted += 1
+                state = trail[-1].inputs.get("concentration")
+                cold_start += state == "cold_start"
+                unfetched += state == "unfetched"
         summary = await repo.decision_summary(db)
     finally:
         await db.close()
@@ -1146,14 +1164,21 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
         print("  rejections by stage:")
         for stage, n in sorted(summary["by_stage"].items()):
             print(f"    stage {stage}: {n:,}")
+    if accepted:
+        print(f"\n  of {accepted:,} accepts, stage 4 saw NOTHING for {unfetched:,} "
+              f"and cold-start zeros for {cold_start:,}")
+        print("  -- those are not clean bills of health, they are absences.")
     if accepted == len(rows):
         print("\n  NOTE every candidate was accepted. Run `structural` to give stage 1")
         print("  something to read, `rugs` to fill n_rugged so stage 2 can fire, and")
         print("  `sample` to collect the liquidity stage 3 reads. Until then this is")
         print("  UNLABELLED, not clean.")
-    print("\n  Stage 3 is half-supplied: liquidity and `rugged` come from data already")
-    print("  collected, but LP lock state and unlock date have no verified field path")
-    print("  in this repo, so they journal as `unknown` rather than as a pass.")
+    if gaps:
+        print("\n  facts no supplier in this repo provides yet:")
+        for key, n in sorted(gaps.items(), key=lambda kv: -kv[1]):
+            print(f"    {key:<36} {n:>7,} candidates   {UNSUPPLIED[key]}")
+        print("\n  Each is wired, thresholded and tested; none is guessed. A field path")
+        print("  nobody verified stays absent rather than becoming a plausible number.")
     return 0
 
 

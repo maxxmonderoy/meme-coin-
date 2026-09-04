@@ -483,6 +483,44 @@ async def test_a_mint_with_no_observations_reaches_stage_3_as_unfetched(any_db):
     assert stage3.inputs == {"liquidity": "unfetched"}
 
 
+async def test_stage_4_gets_the_curve_and_pool_addresses_to_exclude(any_db):
+    """3.4: compute top-10 excluding pool, bonding-curve and locker addresses
+    'or you'll reject on the curve itself'. Two of the three come from here."""
+    import datetime as dt
+
+    from trenches.db import repo
+    from trenches.decide import facts_from_row
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="MX", stream_id=1, feed="f",
+                            fields={"bonding_curve": "CURVE1"})
+    at = T0 + dt.timedelta(minutes=5)
+    await repo.record_observation(any_db, mint="MX", fields={
+        "observed_at": at, "scheduled_for": at, "source": "dexscreener",
+        "status": "indexed", "pair_address": "POOL1", "age_seconds": 300})
+
+    row, = [r for r in await repo.candidates_for_decision(any_db) if r["mint"] == "MX"]
+    built = facts_from_row(row)
+    assert built["excluded_addresses"] == ["CURVE1", "POOL1"]
+    assert built["detected_at"] is not None
+
+
+async def test_stage_4_journals_unfetched_because_nothing_supplies_it(any_db):
+    """The honest state of stage 4 today, asserted so it cannot silently drift
+    into looking like a stage that ran."""
+    from trenches.db import repo
+    from trenches.decide import Cascade
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="MY", stream_id=1, feed="f", fields={})
+    row, = [r for r in await repo.candidates_for_decision(any_db) if r["mint"] == "MY"]
+
+    _, trail = Cascade().run(dict(row))
+    stage4 = next(v for v in trail if v.stage == 4)
+    assert stage4.accept
+    assert stage4.inputs["concentration"] == "unfetched"
+
+
 async def test_coverage_counts_asked_separately_from_answered(any_db):
     """"Asked and got nothing" and "never asked" are different facts."""
     from trenches.db import repo

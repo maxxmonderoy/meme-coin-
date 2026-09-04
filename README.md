@@ -220,7 +220,7 @@ watchdog can catch it, a live feed sends a clean EOF, four failures fire in a
 row to test bounded backoff, and events are replayed to prove dedupe. A soak
 says "nothing went wrong"; this says "we made it go wrong and nothing was lost".
 
-## The cascade, stages 0-3 (paper only)
+## The cascade, stages 0-4 (paper only)
 
 ```bash
 trenches decide --limit 5000     # journal a verdict for every candidate
@@ -285,6 +285,73 @@ The distinction the code works hardest to keep is between **unknown** and
 candidate with liquidity but no lock data records the liquidity and marks the
 rest `unknown`. Those are different facts, and a journal that cannot tell them
 apart is the one that later justifies a loss.
+
+### Stage 4: concentration, coordination, and the cold start
+
+Five rejections, and every number is quoted from 3.4 rather than chosen here:
+`dev.percentage > 5`, `snipers.total > 20`, `insiders.total > 20`,
+`bundlers.total > 15`, `bundlers.count >= 100`. The comparators are copied
+exactly — bundler *count* is `>=` while the rest are strictly `>` — because the
+boundary is where a filter gets argued about. All reasons are collected rather
+than short-circuited: they come from one payload, so reading all of them is
+free, and a row saying "snipers AND insiders AND bundlers" is worth more later
+than one saying "snipers".
+
+**The cold start is enforced here, not noted.** This is the part of stage 4 that
+matters most. Every one of those rules is *reject if greater than N*, and Part 2
+says every behavioural field starts empty. So an unguarded stage 4 does not
+merely fail to reject a thirty-second-old mint — it **actively passes it**, on a
+payload of structural zeros, and the journal would record a clean sweep. Below
+`TRENCHES_DECIDE_COLD_START_SECONDS` the values are recorded as `cold_start` and
+**no rule may fire on them in either direction**: a number too early to believe
+cannot condemn a token any more than it can clear one. The default is 600s — the
+conservative end of Part 2's 2–10 minute populate window.
+
+`decide` therefore reports its accepts split three ways, because an accept on
+real data and an accept on an absence are opposite facts:
+
+```
+decided 3  accept=1  reject=2
+  of 1 accepts, stage 4 saw NOTHING for 1 and cold-start zeros for 0
+  -- those are not clean bills of health, they are absences.
+```
+
+**Top-10 share excludes the curve**, per 3.4: "compute top-10 excluding pool,
+bonding-curve and locker addresses or you'll reject on the curve itself." On a
+live pump.fun curve the curve holds essentially the whole supply, so a naive
+top-10 reads ~100% for every token that exists and carries no information. The
+curve address comes from the launch and the pool address from the price path;
+**locker addresses have no source here**, so the exclusion list actually applied
+is journalled rather than assumed complete.
+
+**Two quantities are computed and journalled but do not gate by default**,
+because 3.4 gives no number for either:
+
+- **Top-10 share.** 1.5 gives a *delta* — "first 10 buyers hold 17 percentage
+  points more supply than low-risk" — never a level, and a delta cannot be
+  applied to a single token.
+- **The bundler distribution delta**, `totalInitialPercentage - totalPercentage`.
+  3.4: "high initial + low current means they already distributed into you. That
+  delta is more informative than either level and is free in the payload."
+  Informative — with no threshold attached.
+
+Both have opt-in knobs (`max_top10_pct`, `max_bundler_distribution_pct`) that
+default to off. Journalling them now is what makes calibrating them possible;
+gating on a number nobody measured would be a guess wearing a filter's clothes.
+
+**Stage 4 has no supplier and says so.** Nothing in this repo collects dev share,
+sniper, insider or bundler counts, or a holder list, so today stage 4 journals
+`unfetched` for every candidate and `decide` prints the gap list:
+
+```
+  facts no supplier in this repo provides yet:
+    holders            2,153 candidates   no normalised holder list is stored
+    snipers_total      2,153 candidates   behavioural, cold start; nothing collects it
+    ...
+```
+
+That list lives in `decide/facts.py` as data, not as a comment nobody reads —
+the difference between a known gap and a silent one.
 
 ## Derived rug labels
 
