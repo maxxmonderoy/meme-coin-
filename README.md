@@ -220,7 +220,7 @@ watchdog can catch it, a live feed sends a clean EOF, four failures fire in a
 row to test bounded backoff, and events are replayed to prove dedupe. A soak
 says "nothing went wrong"; this says "we made it go wrong and nothing was lost".
 
-## The cascade, stages 0-4 (paper only)
+## The cascade, stages 0-5 (paper only)
 
 ```bash
 trenches decide --limit 5000     # journal a verdict for every candidate
@@ -352,6 +352,62 @@ sniper, insider or bundler counts, or a holder list, so today stage 4 journals
 
 That list lives in `decide/facts.py` as data, not as a comment nobody reads —
 the difference between a known gap and a silent one.
+
+### Stage 5: funding-chain clustering
+
+The only stage that can see what 1.5 measures: **36.5% of supply that appears
+independently held is controlled by coordinated accounts.** Twenty wallets at 2%
+each looks like distribution and is one wallet if nineteen were funded by the
+twentieth. No per-address rule can see that — only the graph. Per 3.4: top-20
+holders ∪ first buyers → strip CEX/DEX/pool/locker → 2-hop funder trace →
+union-find → **reject if the largest non-CEX cluster exceeds 15% of supply.**
+
+**A single address is not a cluster.** One wallet holding 30% is a large holder,
+and stage 4 already asks about those. Counting it here would relabel
+concentration as coordination — the same number, presented as evidence of
+something it is not — so the gate runs on clusters of two or more and the
+largest lone holder is journalled beside it. Both numbers appear in every row,
+which is what shows stage 5 declined to answer stage 4's question.
+
+**Without a CEX label set, stage 5 cannot reject, and this is the single most
+important thing in it.** Two strangers who both withdrew from the same exchange
+share a funder and nothing else. Skip the stripping and every wallet funded from
+one hot wallet unions into a single cluster, that cluster spans most of the
+holder set, and the stage rejects nearly every token *while looking like it
+found coordination in all of them*. **A confident wrong answer is worse than a
+gap**, so an empty CEX set suppresses the rejection and says so in the row and in
+the command's output. There is a test that demonstrates the inversion rather than
+asserting it: six unrelated wallets become one 60% cluster unlabelled, and six
+lone 10% holders labelled.
+
+```bash
+TRENCHES_LABEL_SET_PATH=/path/to/labels.json
+TRENCHES_DECIDE_MAX_CLUSTER_PCT=15
+```
+
+**`labels.example.json` ships with zero addresses in it, deliberately.** An
+exchange hot-wallet address recalled from memory is exactly the invented constant
+Part 0 rule 2 forbids: it looks right, it cannot be checked by reading it, and
+exchanges rotate them. A stale CEX address does not fail loudly — it silently
+stops stripping and the stage's answer inverts. Export a maintained set (Solana
+FM / Solscan account labels, Dune's `solana_utils.labels`, a label endpoint) and
+refresh it on a schedule.
+
+**What is supplied and what is not.** First buyers are free and real —
+`trade_ticks.trader` comes from PumpPortal's `traderPublicKey`, the field that
+actually exists where third-party write-ups claimed `creator`. That is half of
+3.4's address set. The other half (top-20 holders), the per-address supply
+shares, and the funder edges are not: the 2-hop trace needs RPC (3.4: ~80–100
+credits/token) and there is no RPC client in this repo. So today stage 5 records
+`no_edges` and gates on nothing.
+
+**One thing it deliberately does not do: build co-buy edges from arrival times.**
+Part 2 endorses same-*slot* co-buy clustering as the only bundle evidence at t=0
+— but PumpPortal carries no block time, so all this repo has is when a message
+reached our socket. Clustering on that would manufacture coordination out of
+network jitter, which is exactly the failure 3.4 warns about when it says to use
+matched controls or you will fit launch quality and call it coordination. Real
+slots need the gRPC lane in 3.2.
 
 ## Derived rug labels
 

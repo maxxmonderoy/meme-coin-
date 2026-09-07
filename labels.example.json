@@ -1,0 +1,21 @@
+{
+  "_comment": [
+    "Address label sets for cascade stage 5. SHIPPED EMPTY ON PURPOSE.",
+    "3.4 says to strip CEX/DEX/pool/locker addresses before the funding-chain",
+    "trace. Without the CEX set, every wallet funded from one exchange hot",
+    "wallet unions into a single cluster spanning most of the holder set, and",
+    "stage 5 rejects the entire market while looking like it found something.",
+    "So stage 5 computes and journals but does NOT reject until 'cex' is",
+    "non-empty.",
+    "No addresses are filled in here because an exchange hot wallet recalled",
+    "from memory is exactly the invented constant Part 0 rule 2 forbids, and",
+    "exchanges rotate them. Export a maintained set instead -- Solana FM /",
+    "Solscan account labels, Dune's solana_utils.labels, or a label endpoint",
+    "-- and point TRENCHES_LABEL_SET_PATH at the result.",
+    "Refresh it on a schedule. A stale set does not fail loudly."
+  ],
+  "cex": [],
+  "dex": [],
+  "pool": [],
+  "locker": []
+}

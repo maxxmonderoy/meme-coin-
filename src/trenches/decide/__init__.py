@@ -1,4 +1,4 @@
-"""The decision layer. Stages 0-4, PAPER only.
+"""The decision layer. Stages 0-5, PAPER only.
 
 Nothing in this package can construct or sign a transaction, and there is no
 `execute()`. `mode` is a column on `decisions`, never a fork in the code
@@ -20,20 +20,33 @@ from .cascade import (
     stage2_creator,
     stage3_liquidity,
     stage4_concentration,
+    stage5_clustering,
     top10_share,
 )
-from .facts import UNSUPPLIED, facts_from_row, missing_from
+from .cluster import CO_BUY, FUNDING, Clustering, UnionFind, cluster
+from .facts import UNSUPPLIED, attach_first_buyers, facts_from_row, missing_from
+from .labels import EMPTY, LabelSet, load_labels
 
 __all__ = [
+    "CO_BUY",
+    "EMPTY",
+    "FUNDING",
     "UNSUPPLIED",
     "Cascade",
+    "Clustering",
+    "LabelSet",
+    "UnionFind",
     "Verdict",
+    "attach_first_buyers",
+    "cluster",
     "facts_from_row",
+    "load_labels",
     "missing_from",
     "stage0_ingest",
     "stage1_structural",
     "stage2_creator",
     "stage3_liquidity",
     "stage4_concentration",
+    "stage5_clustering",
     "top10_share",
 ]

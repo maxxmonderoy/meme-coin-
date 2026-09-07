@@ -1097,7 +1097,16 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
     """
     import time
 
-    from .decide import UNSUPPLIED, Cascade, facts_from_row, missing_from
+    from .decide import (
+        UNSUPPLIED,
+        Cascade,
+        attach_first_buyers,
+        facts_from_row,
+        load_labels,
+        missing_from,
+    )
+
+    labels = load_labels(cfg.label_set_path or None)
 
     cascade = Cascade(
         min_mints=cfg.decide_creator_min_mints,
@@ -1110,6 +1119,8 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
         max_bundler_pct=cfg.decide_max_bundler_pct,
         max_bundler_count=cfg.decide_max_bundler_count,
         cold_start_seconds=cfg.decide_cold_start_seconds,
+        max_cluster_pct=cfg.decide_max_cluster_pct,
+        labels=labels,
     )
     thresholds = cascade.thresholds()
     version = code_version()
@@ -1120,16 +1131,21 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
         if not rows:
             print("no undecided candidates")
             return 0
+        # One query for every candidate rather than one per candidate: stage 5's
+        # address set is free, but N round trips over 5,000 mints is not.
+        buyers = await repo.first_buyers(db)
         accepted = rejected = 0
         #: An accept is not one thing. A candidate that passed a stage on real
         #: data and one that passed it because nothing was fetched are opposite
         #: facts, and a headline "accept" count that merges them is the number
         #: that later gets mistaken for a filter working.
-        cold_start = unfetched = 0
+        cold_start = unfetched = clustered = 0
         gaps: dict[str, int] = {}
         for row in rows:
             started = time.perf_counter()
-            facts = facts_from_row(row)
+            facts = attach_first_buyers(
+                facts_from_row(row), buyers.get(row["mint"]),
+            )
             for key in missing_from(facts):
                 gaps[key] = gaps.get(key, 0) + 1
             verdict, trail = cascade.run(facts)
@@ -1150,9 +1166,11 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
                 rejected += 1
             else:
                 accepted += 1
-                state = trail[-1].inputs.get("concentration")
+                by_stage = {v.stage: v.inputs for v in trail}
+                state = by_stage.get(4, {}).get("concentration")
                 cold_start += state == "cold_start"
                 unfetched += state == "unfetched"
+                clustered += by_stage.get(5, {}).get("clustering") is None
         summary = await repo.decision_summary(db)
     finally:
         await db.close()
@@ -1167,7 +1185,15 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
     if accepted:
         print(f"\n  of {accepted:,} accepts, stage 4 saw NOTHING for {unfetched:,} "
               f"and cold-start zeros for {cold_start:,}")
-        print("  -- those are not clean bills of health, they are absences.")
+        print(f"  stage 5 actually clustered {clustered:,} of them")
+        print("  -- the rest are not clean bills of health, they are absences.")
+    if not labels.usable:
+        print(f"\n  STAGE 5 CANNOT REJECT: no CEX label set (source: {labels.source}).")
+        print("  Without one, every wallet funded from a single exchange hot wallet")
+        print("  unions into one cluster spanning most of the holder set, and the")
+        print("  stage would reject nearly every token while looking like it found")
+        print("  coordination. It computes and journals; it does not gate. Point")
+        print("  TRENCHES_LABEL_SET_PATH at a maintained set -- see labels.example.json.")
     if accepted == len(rows):
         print("\n  NOTE every candidate was accepted. Run `structural` to give stage 1")
         print("  something to read, `rugs` to fill n_rugged so stage 2 can fire, and")

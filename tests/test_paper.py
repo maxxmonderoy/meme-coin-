@@ -521,6 +521,62 @@ async def test_stage_4_journals_unfetched_because_nothing_supplies_it(any_db):
     assert stage4.inputs["concentration"] == "unfetched"
 
 
+async def test_first_buyers_are_free_and_ordered_and_deduplicated(any_db):
+    """Stage 5's address set, half of it, from data already collected. The
+    window function has to run on both dialects, which is what any_db checks."""
+    import datetime as dt
+
+    from trenches.db import repo
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="MB", stream_id=1, feed="f", fields={})
+    # W1 buys twice; a sell must not make a buyer; nulls must not become one.
+    ticks = [
+        ("s1", "W1", 1, 1), ("s2", "W2", 1, 2), ("s3", "W1", 1, 3),
+        ("s4", "W3", 0, 4), ("s5", None, 1, 5), ("s6", "W4", 1, 6),
+    ]
+    for sig, trader, is_buy, minute in ticks:
+        await repo.insert_trade_tick(any_db, mint="MB", signature=sig, fields={
+            "observed_at": T0 + dt.timedelta(minutes=minute),
+            "is_buy": is_buy, "trader": trader, "source": "pumpportal"})
+
+    buyers = await repo.first_buyers(any_db, per_mint=10)
+    assert buyers["MB"] == ["W1", "W2", "W4"]
+
+
+async def test_first_buyers_respects_the_per_mint_cap(any_db):
+    import datetime as dt
+
+    from trenches.db import repo
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="MC", stream_id=1, feed="f", fields={})
+    for i in range(10):
+        await repo.insert_trade_tick(any_db, mint="MC", signature=f"s{i}", fields={
+            "observed_at": T0 + dt.timedelta(seconds=i), "is_buy": 1,
+            "trader": f"W{i}", "source": "pumpportal"})
+
+    assert await repo.first_buyers(any_db, per_mint=3) == {"MC": ["W0", "W1", "W2"]}
+
+
+async def test_stage_5_journals_unfetched_when_no_buyer_was_observed(any_db):
+    """The honest state of stage 5 today: the funder trace needs RPC and there
+    is no RPC client here, so even with an address set there are no edges."""
+    from trenches.db import repo
+    from trenches.decide import Cascade, attach_first_buyers, facts_from_row
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="MZ", stream_id=1, feed="f", fields={})
+    row, = [r for r in await repo.candidates_for_decision(any_db) if r["mint"] == "MZ"]
+    buyers = await repo.first_buyers(any_db)
+
+    facts = attach_first_buyers(facts_from_row(row), buyers.get("MZ"))
+    _, trail = Cascade().run(facts)
+    stage5 = next(v for v in trail if v.stage == 5)
+    assert stage5.accept
+    assert stage5.inputs["clustering"] == "unfetched"
+
+
 async def test_coverage_counts_asked_separately_from_answered(any_db):
     """"Asked and got nothing" and "never asked" are different facts."""
     from trenches.db import repo

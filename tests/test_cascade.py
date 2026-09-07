@@ -493,7 +493,7 @@ def test_the_cascade_stops_at_the_first_rejection():
 def test_a_clean_candidate_runs_every_stage():
     verdict, trail = Cascade().run(facts(mintable=0, freezable=0))
     assert verdict.accept
-    assert [v.stage for v in trail] == [0, 1, 2, 3, 4]
+    assert [v.stage for v in trail] == [0, 1, 2, 3, 4, 5]
 
 
 def test_the_cascade_reaches_stage_3_and_can_reject_there():
@@ -509,7 +509,7 @@ def test_the_cascade_reaches_stage_4_and_can_reject_there():
         snipers_total=99,
     ))
     assert verdict.rejected and verdict.stage == 4
-    assert [v.stage for v in trail] == [0, 1, 2, 3, 4]
+    assert [v.stage for v in trail] == [0, 1, 2, 3, 4]      # stage 5 never ran
 
 
 def test_stage_3_runs_last_because_it_costs_a_request():
@@ -527,10 +527,13 @@ def test_thresholds_are_snapshotted_for_the_journal():
     assert t["creator_max_rug_rate"] == 0.9
     assert t["min_liquidity_usd"] == 2_500
     assert t["hold_horizon_seconds"] == 3600
-    assert t["stages"] == [0, 1, 2, 3, 4]
+    assert t["stages"] == [0, 1, 2, 3, 4, 5]
     assert t["max_dev_pct"] == 5.0
     assert t["max_snipers"] == 20
     assert t["cold_start_seconds"] == 600
+    assert t["max_cluster_pct"] == 15.0
+    # Which label set was in force decides what a stage-5 row MEANS.
+    assert t["label_set"]["source"] == "empty" and t["label_set"]["cex"] == 0
 
 
 def test_the_journal_records_that_the_thresholds_are_uncalibrated():

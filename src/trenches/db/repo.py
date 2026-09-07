@@ -865,6 +865,50 @@ async def insert_trade_tick(db: Database, *, mint: str, signature: str, fields: 
     return not status.endswith(" 0")
 
 
+async def first_buyers(
+    db: Database, *, per_mint: int = 20, limit: int = 200_000
+) -> dict[str, list[str]]:
+    """The first N distinct buyers per mint, in order. Stage 5's address set.
+
+    3.4 stage 5 clusters "top-20 holders UNION first buyers". This is the
+    second half, and it is free: `trade_ticks.trader` is already collected from
+    PumpPortal, whose `traderPublicKey` field IS verified (see the create-frame
+    note in stream/pumpportal.py -- it is the field that exists where the
+    third-party write-ups claimed `creator`).
+
+    ORDER IS ARRIVAL ORDER, NOT BLOCK ORDER, and that distinction limits what
+    this can be used for. PumpPortal carries no block time (schema 004), so two
+    buys in the same slot are ordered here by which reached our socket first.
+    That is fine for "who bought early" -- the set is what stage 5 clusters --
+    and NOT fine for same-slot co-buy detection (Part 2), which needs real slot
+    numbers. Building co-buy edges out of arrival timestamps would manufacture
+    coordination out of network jitter, which is the exact mistake 3.4 warns
+    about when it says to use matched controls or you will fit launch quality
+    and call it coordination.
+
+    `row_number() over (partition by ...)` runs on both dialects; the ordering
+    key includes `signature` so the same table always yields the same list.
+    """
+    rows = await db.fetch(
+        "select mint, trader from ("
+        "  select mint, trader,"
+        "         row_number() over ("
+        "             partition by mint order by observed_at, signature"
+        "         ) as rn"
+        "  from trade_ticks where is_buy = 1 and trader is not null"
+        ") ranked where rn <= ? limit ?",
+        per_mint, limit,
+    )
+    out: dict[str, list[str]] = {}
+    for row in rows:
+        buyers = out.setdefault(row["mint"], [])
+        # Distinct, order preserved: one wallet buying five times is one buyer,
+        # and counting it five times would inflate every cluster it lands in.
+        if row["trader"] not in buyers:
+            buyers.append(row["trader"])
+    return out
+
+
 async def ticks_for_mint(db: Database, mint: str, *, limit: int = 100_000) -> list[dict]:
     return await db.fetch(
         "select * from trade_ticks where mint = ? order by observed_at, signature limit ?",

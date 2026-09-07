@@ -99,6 +99,8 @@ class Config:
     decide_max_bundler_pct: float
     decide_max_bundler_count: int
     decide_cold_start_seconds: int
+    decide_max_cluster_pct: float
+    label_set_path: str
     log_level: str = field(default="INFO")
 
     @staticmethod
@@ -172,6 +174,10 @@ class Config:
             # Below this age a behavioural zero is a cold start, not a clean
             # result, and every stage-4 rule passes on zero (Part 2).
             decide_cold_start_seconds=_get_int("TRENCHES_DECIDE_COLD_START_SECONDS", 600),
+            # Stage 5. 15% IS 3.4's number. The label set below is what decides
+            # whether it may fire at all -- see decide/labels.py.
+            decide_max_cluster_pct=_get_float("TRENCHES_DECIDE_MAX_CLUSTER_PCT", 15.0),
+            label_set_path=_get("TRENCHES_LABEL_SET_PATH", ""),
             log_level=_get("TRENCHES_LOG_LEVEL", "INFO"),
         )
         if cfg.workers < 1:

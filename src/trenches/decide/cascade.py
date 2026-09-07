@@ -1,4 +1,4 @@
-"""Stages 0-4 of the 3.4 cascade, as pure functions.
+"""Stages 0-5 of the 3.4 cascade, as pure functions.
 
 ORDERING SAVES MORE MONEY THAN CACHING (3.4). Stages run cheapest-first so the
 ~95% of candidates that die early never reach a paid lookup. Each stage here is
@@ -20,6 +20,14 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass, field
 from typing import Any
+
+from .cluster import (
+    DEFAULT_MAX_CLUSTER_PCT,
+    FUNDING,
+    cluster,
+    normalise_addresses,
+)
+from .labels import EMPTY, LabelSet
 
 #: 3.4 stage 2. Note this rule CANNOT FIRE YET: rug_rate needs `n_rugged`, and
 #: nothing labels rugs, so every creator reads 0.0. It is wired and journalled
@@ -480,6 +488,114 @@ def _age_seconds(facts: dict, *, now: dt.datetime) -> int | None:
     return int((now - detected).total_seconds())
 
 
+def stage5_clustering(
+    facts: dict,
+    *,
+    max_cluster_pct: float = DEFAULT_MAX_CLUSTER_PCT,
+    labels: LabelSet = EMPTY,
+) -> Verdict:
+    """Funding-chain clustering over survivors only (3.4 stage 5). In-house.
+
+    3.4: top-20 holders union first buyers -> strip CEX/DEX/pool/locker via
+    cached label sets -> 2-hop funder trace -> union-find -> reject if the
+    largest non-CEX cluster exceeds 15% of supply.
+
+    WHY THIS STAGE IS LAST AND WHY IT IS WORTH IT. It is the only stage that
+    costs RPC calls (3.4: ~80-100 credits/token), which is affordable precisely
+    because stages 0-4 have already killed most of the volume. It is also the
+    only stage that can see the thing 1.5 measures: 36.5% of supply that appears
+    independently held is controlled by coordinated accounts. Twenty wallets at
+    2% each is distribution; the same twenty are one wallet if nineteen were
+    funded by the twentieth. No per-address rule can see that -- only the graph.
+
+    FOUR REASONS IT MAY DECLINE TO GATE, each recorded distinctly:
+
+    - `unfetched`: no address set. Nothing was traced.
+    - `no_edges`: addresses but no funding edges. Every address is then its own
+      cluster and the "largest cluster" is just the largest single holder --
+      which is stage 4's question, answered worse. Reporting that as a
+      clustering result would be a concentration number wearing a coordination
+      label.
+    - `labels_missing`: edges, but no CEX label set. This is the dangerous one
+      and it fails toward silence rather than toward a verdict; see below.
+    - `unmeasurable`: a cluster exists but no member's supply share is known, so
+      "exceeds 15% of supply" has no left-hand side.
+
+    THE LABEL SET IS NOT OPTIONAL. Without CEX addresses stripped, every wallet
+    funded from one exchange hot wallet unions into a single cluster, that
+    cluster spans most of the holder set, and the stage rejects nearly every
+    token while looking like it found coordination in all of them. A confident
+    wrong answer is worse than a gap, so an empty CEX set suppresses the
+    rejection and says why in the row.
+    """
+    addresses = facts.get("cluster_addresses") or ()
+    strip = labels.strip_map({
+        str(a): "pool" for a in (facts.get("excluded_addresses") or ()) if a
+    })
+    seen: dict[str, Any] = {
+        "labels_source": labels.source,
+        "labels": labels.counts(),
+    }
+
+    if not normalise_addresses(addresses):
+        return Verdict(True, 5, None, {"clustering": "unfetched", **seen})
+
+    found = cluster(addresses, facts.get("cluster_edges") or (), strip=strip)
+    holdings = _holdings(facts.get("holdings"))
+    share, members = found.largest(holdings)
+
+    seen.update({
+        "n_addresses": len(normalise_addresses(addresses)),
+        "n_stripped": len(found.stripped),
+        "n_clusters": len(found.clusters),
+        "largest_cluster_size": max((len(c) for c in found.clusters), default=0),
+        "n_multi_address_clusters": sum(1 for c in found.clusters if len(c) > 1),
+        "relations": sorted(found.relations),
+        "edges_dropped_at_a_label": found.edges_dropped,
+        "coverage_pct": found.coverage(holdings),
+    })
+    if share is not None:
+        seen["largest_cluster_pct"] = share
+        seen["largest_cluster"] = sorted(members)[:20]
+    single = found.largest_single(holdings)
+    if single is not None:
+        # Journalled, never gated on here. Stage 4 owns lone holders; showing
+        # both numbers is what proves stage 5 did not quietly answer stage 4's
+        # question and call the answer coordination.
+        seen["largest_single_holder_pct"] = single
+
+    if FUNDING not in found.relations:
+        # Includes the co-buy-only case. 3.4's 15% was stated for funding
+        # chains; applying it to a different relation would be inventing a
+        # number for that relation rather than quoting one.
+        return Verdict(True, 5, None, {**seen, "clustering": "no_edges"})
+    if not labels.usable:
+        return Verdict(True, 5, None, {**seen, "clustering": "labels_missing"})
+    if share is None:
+        return Verdict(True, 5, None, {**seen, "clustering": "unmeasurable"})
+
+    if share > max_cluster_pct:
+        return Verdict(
+            False, 5,
+            f"largest non-CEX cluster holds {share:.1f}% of supply across "
+            f"{len(members)} addresses (> {max_cluster_pct:g}%)",
+            seen,
+        )
+    return Verdict(True, 5, None, seen)
+
+
+def _holdings(value: Any) -> dict[str, float] | None:
+    """address -> percent of supply, or None. Never raises."""
+    if not isinstance(value, dict):
+        return None
+    out: dict[str, float] = {}
+    for address, pct in value.items():
+        parsed = _number(pct)
+        if address is not None and parsed is not None:
+            out[str(address)] = parsed
+    return out or None
+
+
 def _number(value: Any) -> float | None:
     """Parse a numeric field, or None. Never raises, never guesses a default."""
     if value is None or isinstance(value, bool):
@@ -549,6 +665,9 @@ class Cascade:
     #: Off unless set. 3.4 gives no number for either; see stage4_concentration.
     max_top10_pct: float | None = None
     max_bundler_distribution_pct: float | None = None
+    max_cluster_pct: float = DEFAULT_MAX_CLUSTER_PCT
+    #: Stage 5 cannot reject without a CEX set; see labels.py.
+    labels: LabelSet = EMPTY
 
     def thresholds(self) -> dict:
         """Snapshotted into every decision row (3.9.3).
@@ -570,13 +689,18 @@ class Cascade:
             "cold_start_seconds": self.cold_start_seconds,
             "max_top10_pct": self.max_top10_pct,
             "max_bundler_distribution_pct": self.max_bundler_distribution_pct,
+            "max_cluster_pct": self.max_cluster_pct,
+            # Snapshotted because the same clustering run means different things
+            # with and without a CEX set, and a row that does not record which
+            # it had cannot be compared with one that did.
+            "label_set": {"source": self.labels.source, **self.labels.counts()},
             # Stage 4's five gating numbers are quoted from 3.4. Stage 3's
             # floor and stage 4's two derived quantities are NOT measurements:
             # until they are tuned against matched controls they are
             # assumptions, and recording that alongside them keeps a later
             # calibration honest.
             "calibrated": False,
-            "stages": [0, 1, 2, 3, 4],
+            "stages": [0, 1, 2, 3, 4, 5],
         }
 
     def run(self, facts: dict) -> tuple[Verdict, list[Verdict]]:
@@ -602,6 +726,9 @@ class Cascade:
                 cold_start_seconds=self.cold_start_seconds,
                 max_top10_pct=self.max_top10_pct,
                 max_bundler_distribution_pct=self.max_bundler_distribution_pct,
+            ),
+            stage5_clustering(
+                facts, max_cluster_pct=self.max_cluster_pct, labels=self.labels,
             ),
         ):
             trail.append(verdict)

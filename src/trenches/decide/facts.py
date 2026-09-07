@@ -28,7 +28,29 @@ UNSUPPLIED: dict[str, str] = {
     "bundlers_total_initial_percentage": "behavioural; nothing collects it",
     "bundlers_total_percentage": "behavioural; nothing collects it",
     "holders": "no normalised holder list is stored",
+    "cluster_addresses": (
+        "stage 5: first buyers supply half of this set and none were observed "
+        "for this mint; the top-20 holders half has no source"
+    ),
+    "cluster_edges": (
+        "stage 5: the 2-hop funder trace needs RPC and there is no RPC client here"
+    ),
+    "holdings": "stage 5: no per-address supply share is stored",
 }
+
+
+def attach_first_buyers(facts: dict, buyers: list[str] | None) -> dict:
+    """Add stage 5's address set. Mutates and returns `facts`.
+
+    Only half of 3.4's set: first buyers, which `trade_ticks` already has. The
+    top-20 holders half has no source here, so a cluster computed from this
+    alone under-counts -- which is why stage 5 journals the address count
+    beside every share it reports, and why a share computed over four observed
+    buyers should not be read as a supply concentration.
+    """
+    if buyers:
+        facts["cluster_addresses"] = list(buyers)
+    return facts
 
 
 def facts_from_row(row: Any) -> dict:
