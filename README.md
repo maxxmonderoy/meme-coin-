@@ -389,9 +389,19 @@ TRENCHES_DECIDE_MAX_CLUSTER_PCT=15
 exchange hot-wallet address recalled from memory is exactly the invented constant
 Part 0 rule 2 forbids: it looks right, it cannot be checked by reading it, and
 exchanges rotate them. A stale CEX address does not fail loudly — it silently
-stops stripping and the stage's answer inverts. Export a maintained set (Solana
-FM / Solscan account labels, Dune's `solana_utils.labels`, a label endpoint) and
-refresh it on a schedule.
+stops stripping and the stage's answer inverts. Export a maintained set and
+refresh it on a schedule; `decide/labels.py` carries the sources verified
+8 Sep 2026 and the caveat on each — including that Dune's free tier goes
+view-only on 10 Sep 2026 for accounts created before 21 Jul 2026.
+
+**There is a route that needs no vendor.** What the stripping actually needs is
+not "this address is Binance" but "this address is a shared funder whose
+presence is not evidence of coordination". An address that funded tens of
+thousands of distinct wallets is structurally that, whatever it is called — and
+out-degree is computable from the same funding graph the trace already builds.
+No vendor, no staleness, and it catches bridges and faucets a CEX list omits. It
+needs a cutoff nobody has published, so it would ship uncalibrated; the vendor
+list is what calibrates it.
 
 **What is supplied and what is not.** First buyers are free and real —
 `trade_ticks.trader` comes from PumpPortal's `traderPublicKey`, the field that
