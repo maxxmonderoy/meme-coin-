@@ -11,10 +11,23 @@ CEX address does not fail loudly; it silently stops stripping, and stage 5's
 answer inverts (see `LabelSet.usable`).
 
 WHERE TO GET THEM. A labelled address set is a maintained dataset, not a
-constant: Solana FM / Solscan account labels, Dune's `solana_utils.labels`, or
-Helius's address-label endpoint. Export one to JSON in the shape below and
-point TRENCHES_LABEL_SET_PATH at it. `labels.example.json` documents the shape
-with zero addresses in it.
+constant. Verified 8 Sep 2026: Dune exposes `labels.addresses` with a
+`blockchain` column and `label_type = 'cex'`, and public Solana CEX-address
+queries exist on top of it -- but note Dune's free tier goes view-only on
+10 Sep 2026 for accounts created before 21 Jul 2026, and CSV/API export costs
+credits. Vybe Network publishes a Solana labelled-wallets API; Solscan and
+SolanaFM show account labels in their UIs with API access on paid tiers. Export
+one to JSON in the shape below and point TRENCHES_LABEL_SET_PATH at it.
+`labels.example.json` documents the shape with zero addresses in it.
+
+THE VENDOR IS NOT THE ONLY ROUTE, and it may not be the best one. What the
+stripping actually needs is not "this address is Binance" but "this address is a
+shared funder whose presence is not evidence of coordination". An address that
+funded tens of thousands of distinct wallets is structurally that, whatever it
+is called, and out-degree is computable from the same funding graph the trace
+already builds -- no vendor, no staleness, and it catches bridges and faucets
+that a CEX list omits. It needs a cutoff nobody has published, so it would ship
+uncalibrated; the vendor list is the cross-check that calibrates it.
 
     {"cex": ["..."], "dex": ["..."], "pool": ["..."], "locker": ["..."]}
 """

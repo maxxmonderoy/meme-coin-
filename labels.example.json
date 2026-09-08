@@ -9,9 +9,9 @@
     "non-empty.",
     "No addresses are filled in here because an exchange hot wallet recalled",
     "from memory is exactly the invented constant Part 0 rule 2 forbids, and",
-    "exchanges rotate them. Export a maintained set instead -- Solana FM /",
-    "Solscan account labels, Dune's solana_utils.labels, or a label endpoint",
-    "-- and point TRENCHES_LABEL_SET_PATH at the result.",
+    "exchanges rotate them. Export a maintained set instead and point",
+    "TRENCHES_LABEL_SET_PATH at the result. See decide/labels.py for sources",
+    "verified 8 Sep 2026, and for the in-house out-degree alternative.",
     "Refresh it on a schedule. A stale set does not fail loudly."
   ],
   "cex": [],
