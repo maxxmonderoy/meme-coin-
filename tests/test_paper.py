@@ -577,6 +577,120 @@ async def test_stage_5_journals_unfetched_when_no_buyer_was_observed(any_db):
     assert stage5.inputs["clustering"] == "unfetched"
 
 
+async def test_funder_degrees_count_distinct_mints_not_edges(any_db):
+    """The statistic the cutoff applies to. Aggregated in SQL on both dialects."""
+    from trenches.db import repo
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    for mint in ("M1", "M2", "M3"):
+        await repo.upsert_token(any_db, mint=mint, stream_id=1, feed="f", fields={})
+    # HOT funds two wallets in each of three mints: 3 tokens, 6 wallets.
+    for mint in ("M1", "M2", "M3"):
+        await repo.record_funding_edges(any_db, mint=mint, source="test", edges=[
+            {"funder": "HOT", "funded": f"{mint}_a"},
+            {"funder": "HOT", "funded": f"{mint}_b"}])
+    # DEV funds four wallets inside ONE mint: 1 token, 4 wallets. Higher
+    # out-degree per token than HOT, and must NOT out-rank it on n_tokens.
+    await repo.record_funding_edges(any_db, mint="M1", source="test", edges=[
+        {"funder": "DEV", "funded": f"s{i}"} for i in range(4)])
+
+    degrees = {r["address"]: r for r in await repo.funder_degrees(any_db)}
+    assert degrees["HOT"]["n_tokens"] == 3 and degrees["HOT"]["n_funded"] == 6
+    assert degrees["DEV"]["n_tokens"] == 1 and degrees["DEV"]["n_funded"] == 4
+    assert await repo.funder_degrees(any_db, min_tokens=2) == [degrees["HOT"]]
+
+
+async def test_funding_edges_are_not_deduplicated_across_mints(any_db):
+    """Deduplicating (funder, funded) globally would delete the signal."""
+    from trenches.db import repo
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    for mint in ("M1", "M2"):
+        await repo.upsert_token(any_db, mint=mint, stream_id=1, feed="f", fields={})
+        stored = await repo.record_funding_edges(
+            any_db, mint=mint, source="t", edges=[("HOT", "W")])
+        assert stored == 1
+    # The same edge in the same mint is a duplicate, though.
+    assert await repo.record_funding_edges(
+        any_db, mint="M1", source="t", edges=[("HOT", "W")]) == 0
+    assert (await repo.funder_degrees(any_db))[0]["n_tokens"] == 2
+
+
+async def test_known_creators_come_from_our_own_journal_for_free(any_db):
+    from trenches.db import repo
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="M1", stream_id=1, feed="f",
+                            fields={"signer": "SIGNER", "declared_creator": "DECLARED"})
+    await repo.bump_creator(any_db, "CACHED", "signer")
+    assert await repo.known_creators(any_db) == {"SIGNER", "DECLARED", "CACHED"}
+
+
+async def test_funders_of_creators_finds_the_treasury_behind_a_deployer(any_db):
+    """A serial deployer need not sign with the wallet that pays for things."""
+    from trenches.db import repo
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    await repo.upsert_token(any_db, mint="M1", stream_id=1, feed="f",
+                            fields={"signer": "DEPLOYER"})
+    await repo.record_funding_edges(any_db, mint="M1", source="t", edges=[
+        ("TREASURY", "DEPLOYER"), ("CEX", "SHOPPER")])
+    assert await repo.funders_of_creators(any_db) == {"TREASURY"}
+
+
+async def test_derived_labels_round_trip_with_the_cutoff_that_made_them(any_db):
+    """Rewritten wholesale: rows from two different cutoffs must never coexist."""
+    from trenches.db import repo
+    from trenches.decide.funders import FunderStat
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    await repo.save_funder_labels(
+        any_db, cutoff_tokens=100, source="derived(cutoff=100)",
+        labels={"A": FunderStat("A", 400, 9000), "B": FunderStat("B", 220, 5000)})
+    loaded = await repo.load_funder_labels(any_db)
+    assert loaded["addresses"] == frozenset({"A", "B"})
+    assert loaded["cutoff_tokens"] == 100
+
+    await repo.save_funder_labels(
+        any_db, cutoff_tokens=250, source="derived(cutoff=250)",
+        labels={"A": FunderStat("A", 400, 9000)})
+    reloaded = await repo.load_funder_labels(any_db)
+    assert reloaded["addresses"] == frozenset({"A"})
+    assert reloaded["cutoff_tokens"] == 250
+
+
+async def test_derived_labels_reach_the_cascade_and_arm_stage_5(any_db):
+    """End to end: graph -> degrees -> labels -> a stage 5 that can reject."""
+    from trenches.db import repo
+    from trenches.decide import Cascade, load_labels
+    from trenches.decide.funders import derive
+
+    await repo.open_stream(any_db, feeds=["x"], subscription={}, code_version="v")
+    for i in range(5):
+        await repo.upsert_token(any_db, mint=f"M{i}", stream_id=1, feed="f", fields={})
+        await repo.record_funding_edges(any_db, mint=f"M{i}", source="t",
+                                        edges=[("HOT", f"W{i}")])
+
+    stats = await repo.funder_degrees(any_db)
+    derivation = derive(stats, cutoff_tokens=5,
+                        creators=await repo.known_creators(any_db))
+    await repo.save_funder_labels(any_db, labels=derivation.labels,
+                                  cutoff_tokens=5, source="derived(cutoff=5)")
+    stored = await repo.load_funder_labels(any_db)
+
+    labels = load_labels(None).with_shared_funders(
+        stored["addresses"], stored["source"])
+    assert labels.usable
+
+    verdict, _ = Cascade(labels=labels).run({
+        "mint": "M0",
+        "cluster_addresses": ["X", "Y", "HOT"],
+        "cluster_edges": [("X", "Y", "funding")],
+        "holdings": {"X": 30.0, "Y": 30.0},
+    })
+    assert verdict.rejected and verdict.stage == 5
+
+
 async def test_coverage_counts_asked_separately_from_answered(any_db):
     """"Asked and got nothing" and "never asked" are different facts."""
     from trenches.db import repo

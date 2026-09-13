@@ -865,6 +865,122 @@ async def insert_trade_tick(db: Database, *, mint: str, signature: str, fields: 
     return not status.endswith(" 0")
 
 
+# -- funding graph and derived shared-funder labels (3.4 stage 5) -----------
+
+async def record_funding_edges(
+    db: Database, *, mint: str, edges: list, source: str
+) -> int:
+    """Store one token's funding edges. Returns how many were new.
+
+    Keyed (mint, funder, funded): the same funder appearing across many tokens
+    is the signal the labels are derived from, so it is deliberately NOT
+    deduplicated globally.
+    """
+    stored = 0
+    now = iso(_now())
+    for edge in edges or []:
+        funder = edge.get("funder") if isinstance(edge, dict) else edge[0]
+        funded = edge.get("funded") if isinstance(edge, dict) else edge[1]
+        if not funder or not funded or funder == funded:
+            continue
+        hops = edge.get("hops", 1) if isinstance(edge, dict) else 1
+        relation = edge.get("relation", "funding") if isinstance(edge, dict) else "funding"
+        status = await db.execute(
+            "insert into funding_edges (mint, funder, funded, relation, hops, source, "
+            "discovered_at) values (?,?,?,?,?,?,?) "
+            "on conflict (mint, funder, funded) do nothing",
+            mint, str(funder), str(funded), relation, int(hops), source, now,
+        )
+        if not status.endswith(" 0"):
+            stored += 1
+    return stored
+
+
+async def funder_degrees(db: Database, *, min_tokens: int = 1) -> list[dict]:
+    """Per funder: distinct mints it appeared in, and distinct wallets it funded.
+
+    `n_tokens` is what the cutoff applies to. `n_funded` is raw out-degree and
+    is reported but never thresholded -- one deployer funding forty snipers
+    inside a single launch has a high out-degree and is the actor stage 5 exists
+    to catch, not infrastructure.
+    """
+    return await db.fetch(
+        "select funder as address, count(distinct mint) as n_tokens, "
+        "       count(distinct funded) as n_funded "
+        "from funding_edges group by funder having count(distinct mint) >= ? "
+        "order by n_tokens desc, n_funded desc",
+        min_tokens,
+    )
+
+
+async def known_creators(db: Database) -> set[str]:
+    """Every address we have ever seen create a token, from our own journal.
+
+    The guard that stops the derivation stripping serial deployers (1.5: 85.3%
+    of 178,109 net profitable against buyers). Free -- it is a scan of tables
+    already filled by ingest.
+    """
+    out: set[str] = set()
+    for row in await db.fetch(
+        "select signer as a from tokens_seen where signer is not null "
+        "union select declared_creator as a from tokens_seen where declared_creator is not null "
+        "union select address as a from creators"
+    ):
+        if row["a"]:
+            out.add(row["a"])
+    return out
+
+
+async def funders_of_creators(db: Database) -> set[str]:
+    """Funders that bankroll a known creator. A treasury, not an exchange.
+
+    A serial deployer need not sign with the wallet that pays for things, so
+    matching on the creator address alone misses the funding wallet behind it.
+    """
+    rows = await db.fetch(
+        "select distinct e.funder from funding_edges e "
+        "where e.funded in (select address from creators) "
+        "   or e.funded in (select signer from tokens_seen where signer is not null) "
+        "   or e.funded in (select declared_creator from tokens_seen "
+        "                   where declared_creator is not null)"
+    )
+    return {r["funder"] for r in rows if r["funder"]}
+
+
+async def save_funder_labels(
+    db: Database, *, labels: dict, cutoff_tokens: int, source: str
+) -> int:
+    """Rewrite the derived label set wholesale.
+
+    Never edited in place: the cutoff that produced a row must always be the
+    cutoff recorded on it, and a partial update would leave rows derived under
+    two different cutoffs sitting side by side with no way to tell which.
+    """
+    await db.execute("delete from funder_labels")
+    now = iso(_now())
+    for address, stat in labels.items():
+        await db.execute(
+            "insert into funder_labels (address, label, n_tokens, n_funded, "
+            "cutoff_tokens, derived_at, source) values (?,?,?,?,?,?,?)",
+            address, "shared_funder", int(stat.n_tokens), int(stat.n_funded),
+            int(cutoff_tokens), now, source,
+        )
+    return len(labels)
+
+
+async def load_funder_labels(db: Database) -> dict:
+    """The derived set, with the provenance stage 5 snapshots into every row."""
+    rows = await db.fetch(
+        "select address, n_tokens, cutoff_tokens, derived_at, source from funder_labels"
+    )
+    return {
+        "addresses": frozenset(r["address"] for r in rows),
+        "cutoff_tokens": rows[0]["cutoff_tokens"] if rows else None,
+        "derived_at": rows[0]["derived_at"] if rows else None,
+        "source": rows[0]["source"] if rows else None,
+    }
+
+
 async def first_buyers(
     db: Database, *, per_mint: int = 20, limit: int = 200_000
 ) -> dict[str, list[str]]:

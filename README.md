@@ -394,14 +394,48 @@ refresh it on a schedule; `decide/labels.py` carries the sources verified
 8 Sep 2026 and the caveat on each — including that Dune's free tier goes
 view-only on 10 Sep 2026 for accounts created before 21 Jul 2026.
 
-**There is a route that needs no vendor.** What the stripping actually needs is
-not "this address is Binance" but "this address is a shared funder whose
-presence is not evidence of coordination". An address that funded tens of
-thousands of distinct wallets is structurally that, whatever it is called — and
-out-degree is computable from the same funding graph the trace already builds.
-No vendor, no staleness, and it catches bridges and faucets a CEX list omits. It
-needs a cutoff nobody has published, so it would ship uncalibrated; the vendor
-list is what calibrates it.
+### Deriving the label set instead of buying one
+
+```bash
+trenches funders                 # report the distribution, write nothing
+trenches funders --cutoff 100    # derive and store labels
+```
+
+The stripping does not need "this address is Binance". It needs "this funder's
+presence is not evidence of coordination", and that is a property of the graph:
+infrastructure funds wallets across many **unrelated** tokens, while a dev's
+funding wallet funds wallets inside its own launches. Derived this way the set
+never goes stale, costs nothing, and catches bridges and distributors a CEX list
+omits. A derived set arms stage 5 exactly as a bought one does, and the two
+compose — the bought list is authoritative on names, the derived one on currency.
+
+**The statistic is `n_tokens`, not out-degree, and that is the whole design.** A
+deployer funding forty sniper wallets inside one launch has an out-degree of
+forty and is *exactly* the actor stage 5 exists to catch. Counting distinct mints
+separates it from infrastructure; counting edges merges them.
+
+**The failure this mostly defends against.** §1.5: of 178,109 serial deployers
+studied, 85.3% were net profitable against buyers, and the most aggressive ran
+~353 tokens/day. Such a wallet appears across hundreds of mints and **looks
+identical to infrastructure** by any count test — stripping it would erase the
+most extractive actor in the market from the clustering built to find it. So an
+address is never labelled if it is a known creator *or funds one*, checked
+against `tokens_seen.signer` and `creators`, which we already have. On a
+synthetic 300-launch graph the guard withheld both the serial deployer (200
+mints, 1,000 sniper wallets) and the treasury bankrolling it, while labelling the
+exchange and the bridge.
+
+**There is no default cutoff, and the command will not invent one.** Run it bare
+and it prints the observed distribution plus the sharpest break in the data —
+ranked by *ratio*, not absolute width, because these counts span orders of
+magnitude and a 100→200 step would otherwise outrank the 1→100 boundary that
+actually matters. If the counts are smooth it says so: no natural cutoff exists
+and any line drawn is arbitrary. `derive` refuses a cutoff below 2 outright,
+since a funder seen in exactly one token is the single-launch case by definition.
+
+**They are not called `cex`.** Nothing here establishes that any of them is an
+exchange — only that unioning through one would merge wallets with nothing else
+in common, which is all stage 5 needs.
 
 **What is supplied and what is not.** First buyers are free and real —
 `trade_ticks.trader` comes from PumpPortal's `traderPublicKey`, the field that

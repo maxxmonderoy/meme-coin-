@@ -917,6 +917,82 @@ async def cmd_idl_check(cfg: Config, args: argparse.Namespace) -> int:
     return worst
 
 
+async def cmd_funders(cfg: Config, args: argparse.Namespace) -> int:
+    """Derive shared-funder labels from our own funding graph. No vendor.
+
+    Two modes on purpose. `--report` prints the observed distribution of
+    `n_tokens` and does not write anything; writing requires `--cutoff`, which
+    has no default. Nobody has published a cutoff for this, so the operator
+    picks one from the shape of their own data and the number that produced each
+    label is stored on it.
+    """
+    from .decide import funders as fd
+
+    db = await pool_mod.connect(cfg.dsn)
+    try:
+        stats = await repo.funder_degrees(db, min_tokens=1)
+        if not stats:
+            print("no funding edges recorded yet\n")
+            print("  Nothing traces funders in this repo: the 2-hop trace needs RPC")
+            print("  (3.4: ~80-100 credits/token) and there is no RPC client here.")
+            print("  This command works the moment funding_edges has rows in it.")
+            return 0
+
+        dist = fd.distribution(stats)
+        gap = fd.widest_gap(stats)
+        print(f"{len(stats):,} funders over {sum(dist.values()):,} rows\n")
+        print("  n_tokens  funders")
+        for n_tokens, n in list(dist.items())[:25]:
+            print(f"  {n_tokens:>8,}  {n:>7,}")
+        if len(dist) > 25:
+            print(f"  ... {len(dist) - 25} more distinct counts")
+
+        if gap:
+            below, above = gap
+            print(f"\n  widest gap in the data: nothing between {below:,} and {above:,} tokens.")
+            print("  A cutoff anywhere in that range gives the same answer, so the")
+            print("  choice barely matters -- which is the good case.")
+        else:
+            print("\n  NO GAP: the counts are smooth, so there is no natural cutoff here")
+            print("  and any line you draw is arbitrary. Say so in the journal if you")
+            print("  draw one anyway.")
+
+        if args.cutoff is None:
+            print("\n  report only. Pass --cutoff N to derive and store labels.")
+            return 0
+
+        creators = await repo.known_creators(db)
+        derivation = fd.derive(stats, cutoff_tokens=args.cutoff, creators=creators)
+        # Second half of the guard: a deployer need not sign with the wallet
+        # that pays for things.
+        bankrollers = await repo.funders_of_creators(db)
+        for address in sorted(set(derivation.labels) & bankrollers):
+            derivation.withheld[address] = derivation.labels.pop(address)
+
+        source = f"derived(cutoff={args.cutoff})"
+        written = await repo.save_funder_labels(
+            db, labels=derivation.labels, cutoff_tokens=args.cutoff, source=source)
+    finally:
+        await db.close()
+
+    print(f"\n  labelled {written:,} shared funders at cutoff {args.cutoff:,} tokens")
+    if derivation.withheld:
+        print(f"\n  WITHHELD {len(derivation.withheld):,} that met the count but touch a")
+        print("  known creator. Each is a candidate SERIAL DEPLOYER, which is a finding")
+        print("  and not a skipped label -- 1.5: 85.3% of 178,109 studied were net")
+        print("  profitable against buyers. Stripping one would erase the most")
+        print("  extractive actor in the market from the clustering built to find it.")
+        for address, stat in sorted(
+            derivation.withheld.items(), key=lambda kv: -kv[1].n_tokens
+        )[:10]:
+            print(f"    {address[:20]:<20} {stat.n_tokens:>6,} tokens  "
+                  f"{stat.n_funded:>7,} wallets funded")
+    print("\n  These are NOT called `cex`. Nothing here establishes that any of them")
+    print("  is an exchange -- only that unioning through one would merge wallets")
+    print("  with nothing else in common, which is all stage 5 needs.")
+    return 0
+
+
 async def cmd_prune(cfg: Config, args: argparse.Namespace) -> int:
     db = await pool_mod.connect(cfg.dsn)
     try:
@@ -1096,6 +1172,7 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
     different value in that column rather than a different branch.
     """
     import time
+    from dataclasses import replace
 
     from .decide import (
         UNSUPPLIED,
@@ -1134,6 +1211,13 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
         # One query for every candidate rather than one per candidate: stage 5's
         # address set is free, but N round trips over 5,000 mints is not.
         buyers = await repo.first_buyers(db)
+        # The derived set counts toward stage 5's usability exactly as a bought
+        # one does: what the stripping needs is a shared funder identified, not
+        # an exchange named.
+        derived = await repo.load_funder_labels(db)
+        if derived["addresses"]:
+            labels = labels.with_shared_funders(derived["addresses"], derived["source"])
+            cascade = replace(cascade, labels=labels)
         accepted = rejected = 0
         #: An accept is not one thing. A candidate that passed a stage on real
         #: data and one that passed it because nothing was fetched are opposite
@@ -1415,6 +1499,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="delete all but the newest N backups in that directory")
 
     sub.add_parser("idl-check", help="diff the vendored IDL against upstream")
+    funders = sub.add_parser(
+        "funders", help="derive shared-funder labels from the funding graph (no vendor)")
+    funders.add_argument(
+        "--cutoff", type=int, default=None,
+        help="label funders seen in at least this many DISTINCT mints. No default: "
+             "nobody has published one, so run without it first and read the "
+             "distribution.")
     sub.add_parser("prune", help="delete raw_events past the retention window")
     return parser
 
@@ -1428,7 +1519,7 @@ HANDLERS = {
     "sample": cmd_sample,
     "backup": cmd_backup,
     "replay-exits": cmd_replay_exits,
-    "idl-check": cmd_idl_check, "prune": cmd_prune,
+    "idl-check": cmd_idl_check, "prune": cmd_prune, "funders": cmd_funders,
     "label": cmd_label, "rules-report": cmd_rules_report, "gate": cmd_gate,
     "decide": cmd_decide, "rugs": cmd_rugs,
 }

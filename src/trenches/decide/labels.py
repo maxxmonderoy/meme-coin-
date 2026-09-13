@@ -37,7 +37,12 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-KINDS = ("cex", "dex", "pool", "locker")
+KINDS = ("cex", "dex", "pool", "locker", "shared_funder")
+
+#: Kinds whose presence makes stage 5 safe to gate. `dex`, `pool` and `locker`
+#: do NOT: the failure the stripping prevents is a shared FUNDER merging
+#: unrelated wallets, and only these two identify one.
+STRIPS_SHARED_FUNDERS = ("cex", "shared_funder")
 
 
 @dataclass(slots=True, frozen=True)
@@ -48,21 +53,45 @@ class LabelSet:
     dex: frozenset[str] = field(default_factory=frozenset)
     pool: frozenset[str] = field(default_factory=frozenset)
     locker: frozenset[str] = field(default_factory=frozenset)
+    #: Derived from our own funding graph rather than bought. Deliberately not
+    #: merged into `cex`: we have not established these are exchanges, only that
+    #: unioning through them would merge wallets with nothing else in common.
+    shared_funder: frozenset[str] = field(default_factory=frozenset)
     source: str = "empty"
 
     @property
     def usable(self) -> bool:
         """Whether stage 5 may REJECT on a cluster computed with these labels.
 
-        Gated on the CEX set specifically, not on the total. Without it, every
-        wallet funded from one exchange hot wallet unions into a single cluster
-        that spans most of the holder set, and stage 5 rejects the entire market
-        while appearing to have found coordination. That failure is worse than
-        the stage not running, because it produces a confident wrong answer
+        Gated on the sets that identify a SHARED FUNDER -- a bought CEX list, a
+        set derived from our own graph, or both -- not on the total. Without
+        one, every wallet funded from a single exchange hot wallet unions into a
+        cluster spanning most of the holder set, and stage 5 rejects the entire
+        market while appearing to have found coordination. That failure is worse
+        than the stage not running, because it produces a confident wrong answer
         instead of a gap -- so the stage computes and journals, but does not
-        gate, until a CEX set exists.
+        gate, until one exists.
+
+        A DEX, pool or locker set does not satisfy this. Those addresses are not
+        funders and stripping them does nothing about the false cluster.
         """
-        return bool(self.cex)
+        return any(getattr(self, kind) for kind in STRIPS_SHARED_FUNDERS)
+
+    def with_shared_funders(self, addresses, source: str) -> LabelSet:
+        """Return a copy carrying a derived set alongside whatever was loaded.
+
+        The two are complementary rather than alternatives: the bought list is
+        authoritative on names, the derived one never goes stale and covers
+        bridges and distributors a CEX list omits.
+        """
+        kept = frozenset(str(a) for a in (addresses or ()) if a)
+        if not kept:
+            return self
+        merged = f"{self.source}+{source}" if self.source != "empty" else source
+        return LabelSet(
+            cex=self.cex, dex=self.dex, pool=self.pool, locker=self.locker,
+            shared_funder=self.shared_funder | kept, source=merged,
+        )
 
     def strip_map(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         """address -> label, for `cluster(strip=...)`. Per-token pool and curve
