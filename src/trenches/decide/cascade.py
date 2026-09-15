@@ -1,4 +1,4 @@
-"""Stages 0-2 of the 3.4 cascade, as pure functions.
+"""Stages 0-5 of the 3.4 cascade, as pure functions.
 
 ORDERING SAVES MORE MONEY THAN CACHING (3.4). Stages run cheapest-first so the
 ~95% of candidates that die early never reach a paid lookup. Each stage here is
@@ -17,8 +17,17 @@ against labeled outcomes -- not something this module asserts.
 """
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import dataclass, field
 from typing import Any
+
+from .cluster import (
+    DEFAULT_MAX_CLUSTER_PCT,
+    FUNDING,
+    cluster,
+    normalise_addresses,
+)
+from .labels import EMPTY, LabelSet
 
 #: 3.4 stage 2. Note this rule CANNOT FIRE YET: rug_rate needs `n_rugged`, and
 #: nothing labels rugs, so every creator reads 0.0. It is wired and journalled
@@ -157,6 +166,465 @@ def stage2_creator(
     return Verdict(True, 2, None, seen)
 
 
+#: 3.4 stage 3. Liquidity floor in USD.
+#:
+#: UNCALIBRATED. 3.4 does not give a number, and 1.2's $1,000 figure is Solidus's
+#: measure of a token being effectively dead, not a floor for entry. This is a
+#: starting point to be tuned against matched controls once the dense paths have
+#: accumulated -- until then it is an assumption the journal records rather than
+#: a finding, and `thresholds()` snapshots it so tuning later cannot silently
+#: rewrite what earlier rows meant.
+DEFAULT_MIN_LIQUIDITY_USD = 5_000.0
+
+#: Reject if the LP unlocks inside the holding horizon. 3.4: "check the locker's
+#: unlockDate -- reject if it unlocks inside the holding horizon. Almost nobody
+#: does that last one and it's free." A lock that expires while you hold is not
+#: a lock, it is a countdown.
+DEFAULT_HOLD_HORIZON_SECONDS = 6 * 3600
+
+#: LP states that count as locked. Anything else -- including absent -- is
+#: treated as UNKNOWN rather than safe.
+LP_SAFE_STATES = ("burned", "locked")
+
+
+def stage3_liquidity(
+    facts: dict,
+    *,
+    min_liquidity_usd: float = DEFAULT_MIN_LIQUIDITY_USD,
+    hold_horizon_seconds: int = DEFAULT_HOLD_HORIZON_SECONDS,
+    now: dt.datetime | None = None,
+) -> Verdict:
+    """One request's worth of liquidity facts (3.4 stage 3).
+
+    Four rejections, in the order they cost you money:
+
+      1. `rugged` already true. Cheapest possible answer and the only one that
+         needs no interpretation.
+      2. Liquidity below the floor. A pool you cannot exit is not an entry, and
+         the impact model already measures what "cannot exit" means: a $500
+         position into a $300 pool fills under 5% of itself.
+      3. LP neither burned nor locked. The deployer can withdraw at will.
+      4. The lock expires inside the holding horizon.
+
+    UNKNOWN IS NOT A REJECT, and it is not a pass either -- it is recorded as
+    unknown. At the cold start none of these fields exist (Part 2), and
+    rejecting on their absence would reject the entire market for the first few
+    minutes of every token's life while accepting on it would read empty as
+    clean, which Part 2 names the single most expensive mistake available here.
+    """
+    now = now or dt.datetime.now(tz=dt.UTC)
+    seen: dict[str, Any] = {}
+    #: Which of stage 3's fields were actually supplied. Counted rather than
+    #: inferred from `seen`, because `seen` also carries the "unknown" markers
+    #: and would otherwise never be empty -- making "unfetched" unreachable and
+    #: turning a token nobody looked at into one that passed three checks.
+    supplied = 0
+
+    if facts.get("rugged") is not None:
+        supplied += 1
+        seen["rugged"] = facts["rugged"]
+        if _truthy(facts["rugged"]):
+            return Verdict(False, 3, "already flagged rugged", seen)
+
+    liquidity = _number(facts.get("liquidity_usd"))
+    observed_at = _timestamp(facts.get("liquidity_observed_at"))
+    if observed_at is not None:
+        # A liquidity number is only as good as its timestamp. There is no age
+        # gate here -- 3.4 gives no number and inventing one would be a fiction
+        # -- but recording WHEN the reading was taken means a later calibration
+        # can ask whether stale readings decided anything.
+        seen["liquidity_observed_at"] = observed_at.isoformat()
+        seen["liquidity_age_seconds"] = int((now - observed_at).total_seconds())
+    if liquidity is None:
+        seen["liquidity_usd"] = "unknown"
+    else:
+        supplied += 1
+        seen["liquidity_usd"] = liquidity
+        if liquidity < min_liquidity_usd:
+            return Verdict(
+                False, 3,
+                f"liquidity ${liquidity:,.0f} below the ${min_liquidity_usd:,.0f} floor",
+                seen,
+            )
+
+    lp_state = facts.get("lp_state")
+    if lp_state is None:
+        seen["lp_state"] = "unknown"
+    else:
+        supplied += 1
+        seen["lp_state"] = lp_state
+        if str(lp_state).strip().lower() not in LP_SAFE_STATES:
+            return Verdict(False, 3, f"LP neither burned nor locked ({lp_state})", seen)
+
+    unlock = _timestamp(facts.get("lp_unlock_date"))
+    if unlock is None:
+        seen["lp_unlock_date"] = "unknown"
+    else:
+        supplied += 1
+        seen["lp_unlock_date"] = unlock.isoformat()
+        remaining = (unlock - now).total_seconds()
+        seen["lp_unlock_in_seconds"] = int(remaining)
+        if remaining <= 0:
+            return Verdict(False, 3, "LP lock has already expired", seen)
+        if remaining < hold_horizon_seconds:
+            # 3.4's free check. A lock expiring mid-hold is a countdown, and the
+            # deployer chose when it ends.
+            return Verdict(
+                False, 3,
+                f"LP unlocks in {remaining / 3600:.1f}h, inside the "
+                f"{hold_horizon_seconds / 3600:.0f}h holding horizon",
+                seen,
+            )
+
+    if supplied == 0:
+        return Verdict(True, 3, None, {"liquidity": "unfetched"})
+    return Verdict(True, 3, None, seen)
+
+
+#: 3.4 stage 4. Every number here is quoted from 3.4 and gates by default.
+#: `dev.percentage > 5`, `snipers.total > 20`, `insiders.total > 20`,
+#: `bundlers.total > 15` or `bundlers.count >= 100`.
+DEFAULT_MAX_DEV_PCT = 5.0
+DEFAULT_MAX_SNIPERS = 20
+DEFAULT_MAX_INSIDERS = 20
+DEFAULT_MAX_BUNDLER_PCT = 15.0
+DEFAULT_MAX_BUNDLER_COUNT = 100
+
+#: How old a mint must be before a ZERO in a behavioural field is believed.
+#:
+#: This is the number stage 4 cannot work without. Part 2: every behavioural
+#: signal -- bundle %, sniper %, insider clusters, concentration, the score --
+#: has a cold start and needs transaction history that has not happened yet.
+#: All of 3.4's stage-4 rules are "reject if greater than N", so a payload full
+#: of structural zeros does not merely fail to reject a young mint, it ACTIVELY
+#: PASSES it. That is worse than not running the stage.
+#:
+#: Part 2 puts the populate window at 2-10 minutes. The conservative end is
+#: taken deliberately: below it the zeros are recorded as a cold start rather
+#: than as a clean result, and a later calibration can drop those rows instead
+#: of discovering it fitted noise.
+DEFAULT_COLD_START_SECONDS = 600
+
+
+def top10_share(
+    holders: Any, *, exclude: Any = ()
+) -> tuple[float | None, int, list[str]]:
+    """Top-10 supply share EXCLUDING pool, curve and locker addresses (3.4).
+
+    3.4: "Compute top-10 excluding pool, bonding-curve and locker addresses or
+    you'll reject on the curve itself." On a pump.fun launch the curve holds
+    essentially the entire supply, so a naive top-10 reads ~100% for every
+    token alive and carries no information whatsoever.
+
+    Takes an ALREADY NORMALISED list of (address, percentage) pairs -- or dicts
+    with those two keys -- rather than a vendor payload. Mapping a payload into
+    this shape requires knowing the vendor's field names, and inventing those is
+    the one thing Part 0 rule 2 forbids outright; keeping the mapping outside
+    this function means the rule can be tested and calibrated while the supplier
+    is still missing.
+
+    Returns (share, n_counted, excluded_addresses_seen). `share` is None when
+    nothing countable remained, which is NOT zero concentration -- it is no
+    information, and the caller must keep those apart.
+    """
+    excluded = {str(a) for a in (exclude or ()) if a}
+    hit: list[str] = []
+    kept: list[float] = []
+    for entry in holders or []:
+        if isinstance(entry, dict):
+            address, pct = entry.get("address"), entry.get("percentage")
+        elif isinstance(entry, (tuple, list)) and len(entry) == 2:
+            address, pct = entry
+        else:
+            continue
+        value = _number(pct)
+        if value is None:
+            continue
+        if address is not None and str(address) in excluded:
+            hit.append(str(address))
+            continue
+        kept.append(value)
+    if not kept:
+        return None, 0, hit
+    top = sorted(kept, reverse=True)[:10]
+    return round(sum(top), 4), len(top), hit
+
+
+def stage4_concentration(
+    facts: dict,
+    *,
+    max_dev_pct: float = DEFAULT_MAX_DEV_PCT,
+    max_snipers: int = DEFAULT_MAX_SNIPERS,
+    max_insiders: int = DEFAULT_MAX_INSIDERS,
+    max_bundler_pct: float = DEFAULT_MAX_BUNDLER_PCT,
+    max_bundler_count: int = DEFAULT_MAX_BUNDLER_COUNT,
+    cold_start_seconds: int = DEFAULT_COLD_START_SECONDS,
+    max_top10_pct: float | None = None,
+    max_bundler_distribution_pct: float | None = None,
+    now: dt.datetime | None = None,
+) -> Verdict:
+    """Coordination and concentration (3.4 stage 4). Same request as stage 3.
+
+    Five rejections, all with numbers 3.4 states: dev share above 5%, more than
+    20 snipers, more than 20 insiders, bundler share above 15%, or 100+
+    bundlers. Every reason is collected rather than short-circuited -- they come
+    from one payload, so there is no cost to reading all of them and a row
+    saying "snipers AND insiders AND bundlers" is worth more later than one
+    saying "snipers".
+
+    TWO QUANTITIES ARE COMPUTED AND JOURNALLED BUT DO NOT GATE BY DEFAULT,
+    because 3.4 gives no number for either and inventing one is forbidden:
+
+    - Top-10 share excluding pool/curve/locker addresses. 1.5 gives a DELTA
+      ("first 10 buyers hold 17 percentage points more supply than low-risk"),
+      never a level, and a delta cannot be applied to a single token.
+    - The bundlers' `totalInitialPercentage` - `totalPercentage` delta. 3.4:
+      "high initial + low current means they already distributed into you.
+      That delta is more informative than either level and is free in the
+      payload." Informative, but with no threshold attached.
+
+    Both have opt-in knobs that default to off. Journalling them now is what
+    makes calibrating them possible later (3.9.3); gating on a number nobody
+    measured would be a guess wearing a filter's clothes.
+
+    THE COLD START IS ENFORCED, NOT NOTED. See DEFAULT_COLD_START_SECONDS: a
+    behavioural payload read too early is all zeros, and all of these rules pass
+    on zero. Below the floor the zeros are recorded as `cold_start` and no rule
+    is allowed to fire on them in either direction.
+    """
+    now = now or dt.datetime.now(tz=dt.UTC)
+    seen: dict[str, Any] = {}
+    reasons: list[str] = []
+    supplied = 0
+
+    age = _age_seconds(facts, now=now)
+    if age is not None:
+        seen["token_age_seconds"] = age
+
+    numeric = (
+        ("dev_percentage", max_dev_pct, "dev holds {value:.1f}% (> {limit:g}%)", False),
+        ("snipers_total", max_snipers, "{value:.0f} snipers (> {limit:g})", False),
+        ("insiders_total", max_insiders, "{value:.0f} insiders (> {limit:g})", False),
+        ("bundlers_total", max_bundler_pct,
+         "bundlers hold {value:.1f}% (> {limit:g}%)", False),
+        ("bundlers_count", max_bundler_count,
+         "{value:.0f} bundlers (>= {limit:g})", True),
+    )
+    for key, limit, template, inclusive in numeric:
+        value = _number(facts.get(key))
+        if value is None:
+            seen[key] = "unknown"
+            continue
+        supplied += 1
+        seen[key] = value
+        # 3.4's comparators are not uniform: bundlers.count is >=, the rest are
+        # strictly >. Copying them exactly matters at the boundary, which is
+        # exactly where a filter gets argued about.
+        if (value >= limit) if inclusive else (value > limit):
+            reasons.append(template.format(value=value, limit=limit))
+
+    initial = _number(facts.get("bundlers_total_initial_percentage"))
+    current = _number(facts.get("bundlers_total_percentage"))
+    if initial is not None and current is not None:
+        supplied += 1
+        seen["bundlers_total_initial_percentage"] = initial
+        seen["bundlers_total_percentage"] = current
+        distributed = round(initial - current, 4)
+        seen["bundlers_distributed_pct"] = distributed
+        if max_bundler_distribution_pct is not None and distributed >= max_bundler_distribution_pct:
+            reasons.append(
+                f"bundlers already distributed {distributed:.1f}% of supply "
+                f"({initial:.1f}% -> {current:.1f}%)"
+            )
+
+    share, counted, excluded_hit = top10_share(
+        facts.get("holders"), exclude=facts.get("excluded_addresses") or ()
+    )
+    if share is None:
+        seen["top10_pct"] = "unknown"
+    else:
+        supplied += 1
+        seen["top10_pct"] = share
+        seen["top10_counted"] = counted
+        # Recorded so a row can be read later without guessing whether the
+        # exclusion actually ran. An empty list on a pump.fun mint means the
+        # curve was NOT excluded and the number is close to meaningless.
+        seen["top10_excluded"] = excluded_hit
+        if max_top10_pct is not None and share > max_top10_pct:
+            reasons.append(f"top 10 hold {share:.1f}% (> {max_top10_pct:g}%)")
+
+    if supplied == 0:
+        # Terse on purpose: a wall of "unknown" markers reads like a report.
+        # Nothing was supplied, and the age (if we have it) is the only fact
+        # worth keeping, because it is what says whether it was ever going to be.
+        return Verdict(True, 4, None, {
+            "concentration": "unfetched",
+            **{k: v for k, v in seen.items() if v != "unknown"},
+        })
+
+    if age is not None and age < cold_start_seconds:
+        # Part 2. The fields arrived, but too early to mean anything, and every
+        # rule above passes on a zero. Neither accepting nor rejecting on these
+        # values is defensible, so the row says which one it was.
+        return Verdict(True, 4, None, {
+            **seen,
+            "concentration": "cold_start",
+            "cold_start_floor_seconds": cold_start_seconds,
+        })
+
+    if reasons:
+        return Verdict(False, 4, "; ".join(reasons), seen)
+    return Verdict(True, 4, None, seen)
+
+
+def _age_seconds(facts: dict, *, now: dt.datetime) -> int | None:
+    """Token age, from an explicit value or from `detected_at`."""
+    explicit = _number(facts.get("token_age_seconds"))
+    if explicit is not None:
+        return int(explicit)
+    detected = _timestamp(facts.get("detected_at"))
+    if detected is None:
+        return None
+    return int((now - detected).total_seconds())
+
+
+def stage5_clustering(
+    facts: dict,
+    *,
+    max_cluster_pct: float = DEFAULT_MAX_CLUSTER_PCT,
+    labels: LabelSet = EMPTY,
+) -> Verdict:
+    """Funding-chain clustering over survivors only (3.4 stage 5). In-house.
+
+    3.4: top-20 holders union first buyers -> strip CEX/DEX/pool/locker via
+    cached label sets -> 2-hop funder trace -> union-find -> reject if the
+    largest non-CEX cluster exceeds 15% of supply.
+
+    WHY THIS STAGE IS LAST AND WHY IT IS WORTH IT. It is the only stage that
+    costs RPC calls (3.4: ~80-100 credits/token), which is affordable precisely
+    because stages 0-4 have already killed most of the volume. It is also the
+    only stage that can see the thing 1.5 measures: 36.5% of supply that appears
+    independently held is controlled by coordinated accounts. Twenty wallets at
+    2% each is distribution; the same twenty are one wallet if nineteen were
+    funded by the twentieth. No per-address rule can see that -- only the graph.
+
+    FOUR REASONS IT MAY DECLINE TO GATE, each recorded distinctly:
+
+    - `unfetched`: no address set. Nothing was traced.
+    - `no_edges`: addresses but no funding edges. Every address is then its own
+      cluster and the "largest cluster" is just the largest single holder --
+      which is stage 4's question, answered worse. Reporting that as a
+      clustering result would be a concentration number wearing a coordination
+      label.
+    - `labels_missing`: edges, but no CEX label set. This is the dangerous one
+      and it fails toward silence rather than toward a verdict; see below.
+    - `unmeasurable`: a cluster exists but no member's supply share is known, so
+      "exceeds 15% of supply" has no left-hand side.
+
+    THE LABEL SET IS NOT OPTIONAL. Without CEX addresses stripped, every wallet
+    funded from one exchange hot wallet unions into a single cluster, that
+    cluster spans most of the holder set, and the stage rejects nearly every
+    token while looking like it found coordination in all of them. A confident
+    wrong answer is worse than a gap, so an empty CEX set suppresses the
+    rejection and says why in the row.
+    """
+    addresses = facts.get("cluster_addresses") or ()
+    strip = labels.strip_map({
+        str(a): "pool" for a in (facts.get("excluded_addresses") or ()) if a
+    })
+    seen: dict[str, Any] = {
+        "labels_source": labels.source,
+        "labels": labels.counts(),
+    }
+
+    if not normalise_addresses(addresses):
+        return Verdict(True, 5, None, {"clustering": "unfetched", **seen})
+
+    found = cluster(addresses, facts.get("cluster_edges") or (), strip=strip)
+    holdings = _holdings(facts.get("holdings"))
+    share, members = found.largest(holdings)
+
+    seen.update({
+        "n_addresses": len(normalise_addresses(addresses)),
+        "n_stripped": len(found.stripped),
+        "n_clusters": len(found.clusters),
+        "largest_cluster_size": max((len(c) for c in found.clusters), default=0),
+        "n_multi_address_clusters": sum(1 for c in found.clusters if len(c) > 1),
+        "relations": sorted(found.relations),
+        "edges_dropped_at_a_label": found.edges_dropped,
+        "coverage_pct": found.coverage(holdings),
+    })
+    if share is not None:
+        seen["largest_cluster_pct"] = share
+        seen["largest_cluster"] = sorted(members)[:20]
+    single = found.largest_single(holdings)
+    if single is not None:
+        # Journalled, never gated on here. Stage 4 owns lone holders; showing
+        # both numbers is what proves stage 5 did not quietly answer stage 4's
+        # question and call the answer coordination.
+        seen["largest_single_holder_pct"] = single
+
+    if FUNDING not in found.relations:
+        # Includes the co-buy-only case. 3.4's 15% was stated for funding
+        # chains; applying it to a different relation would be inventing a
+        # number for that relation rather than quoting one.
+        return Verdict(True, 5, None, {**seen, "clustering": "no_edges"})
+    if not labels.usable:
+        return Verdict(True, 5, None, {**seen, "clustering": "labels_missing"})
+    if share is None:
+        return Verdict(True, 5, None, {**seen, "clustering": "unmeasurable"})
+
+    if share > max_cluster_pct:
+        return Verdict(
+            False, 5,
+            f"largest non-CEX cluster holds {share:.1f}% of supply across "
+            f"{len(members)} addresses (> {max_cluster_pct:g}%)",
+            seen,
+        )
+    return Verdict(True, 5, None, seen)
+
+
+def _holdings(value: Any) -> dict[str, float] | None:
+    """address -> percent of supply, or None. Never raises."""
+    if not isinstance(value, dict):
+        return None
+    out: dict[str, float] = {}
+    for address, pct in value.items():
+        parsed = _number(pct)
+        if address is not None and parsed is not None:
+            out[str(address)] = parsed
+    return out or None
+
+
+def _number(value: Any) -> float | None:
+    """Parse a numeric field, or None. Never raises, never guesses a default."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(str(value).replace(",", "").replace("$", ""))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed == parsed and parsed not in (float("inf"), float("-inf")) else None
+
+
+def _timestamp(value: Any) -> dt.datetime | None:
+    if isinstance(value, dt.datetime):
+        return value if value.tzinfo else value.replace(tzinfo=dt.UTC)
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        seconds = value / 1000 if value > 10**11 else value
+        try:
+            return dt.datetime.fromtimestamp(seconds, tz=dt.UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.UTC)
+    return None
+
+
 def _truthy(value: Any) -> bool:
     """Vendor booleans arrive as 1/0, "1"/"0", true/false. All mean the same."""
     if isinstance(value, bool):
@@ -186,6 +654,20 @@ class Cascade:
 
     min_mints: int = DEFAULT_CREATOR_MIN_MINTS
     max_rug_rate: float = DEFAULT_CREATOR_MAX_RUG_RATE
+    min_liquidity_usd: float = DEFAULT_MIN_LIQUIDITY_USD
+    hold_horizon_seconds: int = DEFAULT_HOLD_HORIZON_SECONDS
+    max_dev_pct: float = DEFAULT_MAX_DEV_PCT
+    max_snipers: int = DEFAULT_MAX_SNIPERS
+    max_insiders: int = DEFAULT_MAX_INSIDERS
+    max_bundler_pct: float = DEFAULT_MAX_BUNDLER_PCT
+    max_bundler_count: int = DEFAULT_MAX_BUNDLER_COUNT
+    cold_start_seconds: int = DEFAULT_COLD_START_SECONDS
+    #: Off unless set. 3.4 gives no number for either; see stage4_concentration.
+    max_top10_pct: float | None = None
+    max_bundler_distribution_pct: float | None = None
+    max_cluster_pct: float = DEFAULT_MAX_CLUSTER_PCT
+    #: Stage 5 cannot reject without a CEX set; see labels.py.
+    labels: LabelSet = EMPTY
 
     def thresholds(self) -> dict:
         """Snapshotted into every decision row (3.9.3).
@@ -197,7 +679,28 @@ class Cascade:
         return {
             "creator_min_mints": self.min_mints,
             "creator_max_rug_rate": self.max_rug_rate,
-            "stages": [0, 1, 2],
+            "min_liquidity_usd": self.min_liquidity_usd,
+            "hold_horizon_seconds": self.hold_horizon_seconds,
+            "max_dev_pct": self.max_dev_pct,
+            "max_snipers": self.max_snipers,
+            "max_insiders": self.max_insiders,
+            "max_bundler_pct": self.max_bundler_pct,
+            "max_bundler_count": self.max_bundler_count,
+            "cold_start_seconds": self.cold_start_seconds,
+            "max_top10_pct": self.max_top10_pct,
+            "max_bundler_distribution_pct": self.max_bundler_distribution_pct,
+            "max_cluster_pct": self.max_cluster_pct,
+            # Snapshotted because the same clustering run means different things
+            # with and without a CEX set, and a row that does not record which
+            # it had cannot be compared with one that did.
+            "label_set": {"source": self.labels.source, **self.labels.counts()},
+            # Stage 4's five gating numbers are quoted from 3.4. Stage 3's
+            # floor and stage 4's two derived quantities are NOT measurements:
+            # until they are tuned against matched controls they are
+            # assumptions, and recording that alongside them keeps a later
+            # calibration honest.
+            "calibrated": False,
+            "stages": [0, 1, 2, 3, 4, 5],
         }
 
     def run(self, facts: dict) -> tuple[Verdict, list[Verdict]]:
@@ -208,6 +711,24 @@ class Cascade:
             stage1_structural(facts),
             stage2_creator(
                 facts, min_mints=self.min_mints, max_rug_rate=self.max_rug_rate
+            ),
+            stage3_liquidity(
+                facts, min_liquidity_usd=self.min_liquidity_usd,
+                hold_horizon_seconds=self.hold_horizon_seconds,
+            ),
+            stage4_concentration(
+                facts,
+                max_dev_pct=self.max_dev_pct,
+                max_snipers=self.max_snipers,
+                max_insiders=self.max_insiders,
+                max_bundler_pct=self.max_bundler_pct,
+                max_bundler_count=self.max_bundler_count,
+                cold_start_seconds=self.cold_start_seconds,
+                max_top10_pct=self.max_top10_pct,
+                max_bundler_distribution_pct=self.max_bundler_distribution_pct,
+            ),
+            stage5_clustering(
+                facts, max_cluster_pct=self.max_cluster_pct, labels=self.labels,
             ),
         ):
             trail.append(verdict)

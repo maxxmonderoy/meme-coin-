@@ -6,6 +6,7 @@ no dialect-specific casts. Time cutoffs and percentiles are computed in Python.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import itertools
 from decimal import Decimal, InvalidOperation
@@ -17,6 +18,11 @@ from .dialect import Database, base_units, dumps, iso, loads, parse_ts, percenti
 
 def _now() -> dt.datetime:
     return dt.datetime.now(tz=dt.UTC)
+
+
+def _as_iso(value) -> str | None:
+    """Accept a datetime or an already-ISO string; always store text."""
+    return iso(value) if isinstance(value, dt.datetime) else value
 
 
 def _cutoff(hours: float) -> str:
@@ -147,24 +153,64 @@ async def record_second_sight(
     )
 
 
-async def feed_race_summary(db: Database, hours: float = 24) -> list[dict]:
+async def feed_race_summary(db: Database, hours: float = 24) -> dict:
+    """Who saw each mint first, split into CONTESTED and SOLE sightings.
+
+    Reporting a single "wins" count mixes two different populations and invites
+    a conclusion the data does not support. Measured live: one feed won 62.5% of
+    mints, which reads as "somewhat faster" -- but every one of the other feed's
+    730 "wins" had no second sighting at all, meaning the first feed never
+    delivered those launches. The true statement was that it won 100% of races
+    it was actually in, and missed 37.5% of launches outright.
+
+    Those are different facts with different consequences. One is about latency,
+    the other about coverage, and only the split tells you which feed you could
+    drop and what it would cost.
+    """
+    cutoff = _cutoff(hours)
     rows = await db.fetch(
-        "select first_feed, count(*) as wins from feed_latency "
-        "where first_seen_at >= ? group by first_feed order by wins desc",
-        _cutoff(hours),
+        "select first_feed, count(*) as sightings from feed_latency "
+        "where first_seen_at >= ? group by first_feed order by sightings desc",
+        cutoff,
     )
     deltas = await db.fetch(
         "select first_feed, delta_ms from feed_latency "
         "where first_seen_at >= ? and delta_ms is not null",
-        _cutoff(hours),
+        cutoff,
+    )
+    seconds = await db.fetch(
+        "select second_feed, count(*) as n from feed_latency "
+        "where first_seen_at >= ? and second_feed is not null group by second_feed",
+        cutoff,
     )
     by_feed: dict[str, list[int]] = {}
     for row in deltas:
         by_feed.setdefault(row["first_feed"], []).append(int(row["delta_ms"]))
+    seen_second = {r["second_feed"]: int(r["n"]) for r in seconds}
+
+    total = sum(int(r["sightings"]) for r in rows)
+    contested = len(deltas)
+    out = []
     for row in rows:
-        row["delta_ms"] = percentiles(by_feed.get(row["first_feed"], []))
-        row["both_saw"] = len(by_feed.get(row["first_feed"], []))
-    return rows
+        feed = row["first_feed"]
+        wins = int(row["sightings"])
+        won_contested = len(by_feed.get(feed, []))
+        out.append({
+            "feed": feed,
+            "first_sightings": wins,
+            # Races this feed was actually IN: ones it won head-to-head, plus
+            # ones another feed beat it to.
+            "contested_wins": won_contested,
+            "contested_losses": seen_second.get(feed, 0),
+            "sole_sightings": wins - won_contested,
+            "delta_ms": percentiles(by_feed.get(feed, [])),
+        })
+    for row in out:
+        races = row["contested_wins"] + row["contested_losses"]
+        row["contested_win_rate"] = (row["contested_wins"] / races) if races else None
+        row["sole_share"] = (row["sole_sightings"] / total) if total else 0.0
+    return {"feeds": out, "mints": total, "contested": contested,
+            "sole": total - contested}
 
 
 # -- creators --------------------------------------------------------------
@@ -285,6 +331,9 @@ async def stats(db: Database, hours: float = 24) -> dict:
     totals["detect_latency_ms"] = percentiles([int(r["detect_latency_ms"]) for r in latencies])
     totals["per_feed"] = per_feed
     totals["feed_race"] = await feed_race_summary(db, hours)
+    with contextlib.suppress(Exception):
+        # Absent before migration 006; stats must still work on an older db.
+        totals["sampler"] = await sampler_stats(db, hours)
     return totals
 
 
@@ -364,7 +413,11 @@ async def record_outcome(db: Database, *, mint: str, horizon: str, fields: dict)
         "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
         "        ?, ?, ?, ?, ?, ?, ?) "
         "on conflict (mint, horizon) do nothing",
-        mint, horizon, fields["scheduled_for"], fields["observed_at"],
+        # Normalised rather than passed through. SQLite silently coerces a
+        # datetime to text; asyncpg raises. Accepting both here means a caller
+        # cannot write rows that work on one engine and fail on the other --
+        # which is exactly how this was found.
+        mint, horizon, _as_iso(fields["scheduled_for"]), _as_iso(fields["observed_at"]),
         fields.get("lateness_seconds", 0), fields["status"],
         1 if fields.get("ambiguous_no_pool") else 0,
         1 if fields.get("backfilled") else 0,
@@ -450,6 +503,42 @@ async def outcome_coverage(db: Database, horizons: tuple[str, ...]) -> dict:
         venue = r["venue_kind"] or "none"
         bucket["venue"][venue] = bucket["venue"].get(venue, 0) + r["n"]
     return out
+
+
+async def lateness_by_horizon(db: Database, horizons: tuple[str, ...]) -> dict:
+    """How far after its checkpoint each horizon was actually observed.
+
+    Without this, a backlog observed hours late is indistinguishable in the
+    report from one observed on time -- and the two mean completely different
+    things. A token first looked at when it was three hours old, recorded
+    against the 15m horizon, says nothing about minute fifteen.
+    """
+    out: dict[str, dict] = {}
+    for horizon in horizons:
+        rows = await db.fetch(
+            "select lateness_seconds from outcomes where horizon = ? "
+            "and lateness_seconds is not null", horizon)
+        values = [int(r["lateness_seconds"]) for r in rows]
+        out[horizon] = {
+            "n": len(values),
+            "on_time": sum(1 for v in values if v <= 60),
+            **percentiles(values),
+        }
+    return out
+
+
+async def unique_detection_rate(db: Database, hours: float) -> dict:
+    """Unique mints per minute, as distinct from feed sightings per minute.
+
+    Counting events conflates the two feeds seeing the SAME launch with two
+    launches. With two feeds running that overstates the detection rate by
+    roughly the overlap, which is most of it.
+    """
+    cutoff = _cutoff(hours)
+    mints = await db.fetchval(
+        "select count(*) from tokens_seen where detected_at >= ?", cutoff) or 0
+    return {"unique_mints": int(mints),
+            "unique_per_minute": (mints / (hours * 60)) if hours else 0.0}
 
 
 async def due_count(db: Database, horizon: str, horizon_seconds: int) -> int:
@@ -566,18 +655,69 @@ async def gap_attribution(db: Database, days: float = 7) -> dict:
 # -- decisions -------------------------------------------------------------
 
 async def candidates_for_decision(db: Database, *, limit: int = 5000) -> list[dict]:
-    """Candidates with no decision row yet, joined to what stages 0-2 need.
+    """Candidates with no decision row yet, joined to what stages 0-3 need.
 
-    Creator counts come from the local cache (3.4 stage 2), so this is one
-    query and no network call. Structural facts are NOT joined: nothing has
-    fetched them, and stage 1 reports `unfetched` rather than implying a pass.
+    Creator counts come from the local cache (3.4 stage 2), structural flags
+    from `token_structural`, and stage 3's liquidity from the most recent
+    `price_path` observation the sampler already collected -- so this is one
+    query and no network call. 3.4's cost ordering stays a caller decision
+    rather than a lookup hidden inside a predicate.
+
+    A mint with no structural row joins to nulls, and stage 1 reports
+    `unfetched` for it. That is deliberate: absence must stay distinguishable
+    from a clean result, because reading empty as clean is Part 2's most
+    expensive mistake.
+
+    `detected_at`, `bonding_curve` and the latest `pair_address` are here for
+    stage 4: it cannot believe a zero on a mint too young to have one (Part 2),
+    and it must exclude the curve and pool addresses or it rejects on the curve
+    itself.
+
+    STAGE 3 IS ONLY HALF SUPPLIED HERE, and the missing half is named rather
+    than guessed. `liquidity_usd` and `rugged` have verified sources in this
+    repo: DexScreener's `liquidity.usd` (see `label/dexscreener.py`) and
+    RugCheck's top-level `rugged` (see `structural/detectors.py`). `lp_state`
+    and `lp_unlock_date` do NOT -- nothing here has confirmed which field of a
+    RugCheck report carries the locker's `unlockDate`, so those stay absent and
+    stage 3 records them as unknown. Part 0 rule 2: a plausible-sounding field
+    path is worse than a gap.
+
+    STAGE 4 HAS NO SUPPLIER AT ALL beyond those exclusions. Dev share, sniper,
+    insider and bundler counts and the holder list are all behavioural fields
+    with a cold start (Part 2), and none of them is collected by anything in
+    this repo yet, so stage 4 journals `unfetched`. It is wired, tested and
+    thresholded so it starts working the day a supplier lands -- and until then
+    the journal says it did nothing rather than implying it passed.
     """
     return await db.fetch(
         "select t.mint, t.signer, t.declared_creator, t.launchpad, t.symbol, "
-        "       t.is_mayhem_mode, t.stream_id, "
-        "       c.n_mints as creator_n_mints, c.n_rugged as creator_n_rugged "
+        "       t.is_mayhem_mode, t.stream_id, t.detected_at, t.bonding_curve, "
+        "       c.n_mints as creator_n_mints, c.n_rugged as creator_n_rugged, "
+        "       s.mintable, s.freezable, s.closable, s.balance_mutable_authority, "
+        "       s.transfer_fee_upgradable, s.transfer_hook_upgradable, "
+        "       s.metadata_mutable, s.default_account_state_upgradable, "
+        "       s.non_transferable, s.transfer_hook, s.transfer_fee, "
+        "       s.malicious_address, "
+        # Correlated scalar subqueries rather than a window function or a
+        # lateral join: identical text runs on SQLite and Postgres, and
+        # (mint, observed_at) is already indexed on price_path.
+        "       (select p.liquidity_usd from price_path p "
+        "          where p.mint = t.mint and p.liquidity_usd is not null "
+        "          order by p.observed_at desc limit 1) as liquidity_usd, "
+        "       (select p.observed_at from price_path p "
+        "          where p.mint = t.mint and p.liquidity_usd is not null "
+        "          order by p.observed_at desc limit 1) as liquidity_observed_at, "
+        "       (select 1 from structural_events e "
+        "          where e.mint = t.mint and e.event_type = 'rugged' "
+        "          limit 1) as rugged, "
+        # Stage 4 must exclude the curve and the pool or it rejects on the
+        # bonding curve itself, which holds essentially the whole supply.
+        "       (select p.pair_address from price_path p "
+        "          where p.mint = t.mint and p.pair_address is not null "
+        "          order by p.observed_at desc limit 1) as pair_address "
         "from tokens_seen t "
         "left join creators c on c.address = t.signer and c.role = 'signer' "
+        "left join token_structural s on s.mint = t.mint "
         "left join decisions d on d.mint = t.mint "
         "where d.mint is null "
         "order by t.detected_at desc limit ?",
@@ -705,3 +845,534 @@ async def creators_at_risk(db: Database, *, min_mints: int, max_rug_rate: float)
             if rate >= max_rug_rate:
                 out.append({**r, "rug_rate": round(rate, 4)})
     return out
+
+
+# -- paper trading ---------------------------------------------------------
+
+async def insert_trade_tick(db: Database, *, mint: str, signature: str, fields: dict) -> bool:
+    """Store one observed trade. False when already seen (dedupe on signature)."""
+    status = await db.execute(
+        "insert into trade_ticks "
+        "(mint, signature, observed_at, is_buy, sol_amount, token_amount, price_sol, "
+        " trader, pool, source, payload) "
+        "values (?,?,?,?,?,?,?,?,?,?,?) on conflict (mint, signature) do nothing",
+        mint, signature, iso(fields.get("observed_at") or _now()),
+        None if fields.get("is_buy") is None else int(bool(fields["is_buy"])),
+        fields.get("sol_amount"), fields.get("token_amount"), fields.get("price_sol"),
+        fields.get("trader"), fields.get("pool"), fields.get("source", "pumpportal"),
+        dumps(fields.get("payload")),
+    )
+    return not status.endswith(" 0")
+
+
+# -- funding graph and derived shared-funder labels (3.4 stage 5) -----------
+
+async def record_funding_edges(
+    db: Database, *, mint: str, edges: list, source: str
+) -> int:
+    """Store one token's funding edges. Returns how many were new.
+
+    Keyed (mint, funder, funded): the same funder appearing across many tokens
+    is the signal the labels are derived from, so it is deliberately NOT
+    deduplicated globally.
+    """
+    stored = 0
+    now = iso(_now())
+    for edge in edges or []:
+        funder = edge.get("funder") if isinstance(edge, dict) else edge[0]
+        funded = edge.get("funded") if isinstance(edge, dict) else edge[1]
+        if not funder or not funded or funder == funded:
+            continue
+        hops = edge.get("hops", 1) if isinstance(edge, dict) else 1
+        relation = edge.get("relation", "funding") if isinstance(edge, dict) else "funding"
+        status = await db.execute(
+            "insert into funding_edges (mint, funder, funded, relation, hops, source, "
+            "discovered_at) values (?,?,?,?,?,?,?) "
+            "on conflict (mint, funder, funded) do nothing",
+            mint, str(funder), str(funded), relation, int(hops), source, now,
+        )
+        if not status.endswith(" 0"):
+            stored += 1
+    return stored
+
+
+async def funder_degrees(db: Database, *, min_tokens: int = 1) -> list[dict]:
+    """Per funder: distinct mints it appeared in, and distinct wallets it funded.
+
+    `n_tokens` is what the cutoff applies to. `n_funded` is raw out-degree and
+    is reported but never thresholded -- one deployer funding forty snipers
+    inside a single launch has a high out-degree and is the actor stage 5 exists
+    to catch, not infrastructure.
+    """
+    return await db.fetch(
+        "select funder as address, count(distinct mint) as n_tokens, "
+        "       count(distinct funded) as n_funded "
+        "from funding_edges group by funder having count(distinct mint) >= ? "
+        "order by n_tokens desc, n_funded desc",
+        min_tokens,
+    )
+
+
+async def known_creators(db: Database) -> set[str]:
+    """Every address we have ever seen create a token, from our own journal.
+
+    The guard that stops the derivation stripping serial deployers (1.5: 85.3%
+    of 178,109 net profitable against buyers). Free -- it is a scan of tables
+    already filled by ingest.
+    """
+    out: set[str] = set()
+    for row in await db.fetch(
+        "select signer as a from tokens_seen where signer is not null "
+        "union select declared_creator as a from tokens_seen where declared_creator is not null "
+        "union select address as a from creators"
+    ):
+        if row["a"]:
+            out.add(row["a"])
+    return out
+
+
+async def funders_of_creators(db: Database) -> set[str]:
+    """Funders that bankroll a known creator. A treasury, not an exchange.
+
+    A serial deployer need not sign with the wallet that pays for things, so
+    matching on the creator address alone misses the funding wallet behind it.
+    """
+    rows = await db.fetch(
+        "select distinct e.funder from funding_edges e "
+        "where e.funded in (select address from creators) "
+        "   or e.funded in (select signer from tokens_seen where signer is not null) "
+        "   or e.funded in (select declared_creator from tokens_seen "
+        "                   where declared_creator is not null)"
+    )
+    return {r["funder"] for r in rows if r["funder"]}
+
+
+async def save_funder_labels(
+    db: Database, *, labels: dict, cutoff_tokens: int, source: str
+) -> int:
+    """Rewrite the derived label set wholesale.
+
+    Never edited in place: the cutoff that produced a row must always be the
+    cutoff recorded on it, and a partial update would leave rows derived under
+    two different cutoffs sitting side by side with no way to tell which.
+    """
+    await db.execute("delete from funder_labels")
+    now = iso(_now())
+    for address, stat in labels.items():
+        await db.execute(
+            "insert into funder_labels (address, label, n_tokens, n_funded, "
+            "cutoff_tokens, derived_at, source) values (?,?,?,?,?,?,?)",
+            address, "shared_funder", int(stat.n_tokens), int(stat.n_funded),
+            int(cutoff_tokens), now, source,
+        )
+    return len(labels)
+
+
+async def load_funder_labels(db: Database) -> dict:
+    """The derived set, with the provenance stage 5 snapshots into every row."""
+    rows = await db.fetch(
+        "select address, n_tokens, cutoff_tokens, derived_at, source from funder_labels"
+    )
+    return {
+        "addresses": frozenset(r["address"] for r in rows),
+        "cutoff_tokens": rows[0]["cutoff_tokens"] if rows else None,
+        "derived_at": rows[0]["derived_at"] if rows else None,
+        "source": rows[0]["source"] if rows else None,
+    }
+
+
+async def first_buyers(
+    db: Database, *, per_mint: int = 20, limit: int = 200_000
+) -> dict[str, list[str]]:
+    """The first N distinct buyers per mint, in order. Stage 5's address set.
+
+    3.4 stage 5 clusters "top-20 holders UNION first buyers". This is the
+    second half, and it is free: `trade_ticks.trader` is already collected from
+    PumpPortal, whose `traderPublicKey` field IS verified (see the create-frame
+    note in stream/pumpportal.py -- it is the field that exists where the
+    third-party write-ups claimed `creator`).
+
+    ORDER IS ARRIVAL ORDER, NOT BLOCK ORDER, and that distinction limits what
+    this can be used for. PumpPortal carries no block time (schema 004), so two
+    buys in the same slot are ordered here by which reached our socket first.
+    That is fine for "who bought early" -- the set is what stage 5 clusters --
+    and NOT fine for same-slot co-buy detection (Part 2), which needs real slot
+    numbers. Building co-buy edges out of arrival timestamps would manufacture
+    coordination out of network jitter, which is the exact mistake 3.4 warns
+    about when it says to use matched controls or you will fit launch quality
+    and call it coordination.
+
+    `row_number() over (partition by ...)` runs on both dialects; the ordering
+    key includes `signature` so the same table always yields the same list.
+    """
+    rows = await db.fetch(
+        "select mint, trader from ("
+        "  select mint, trader,"
+        "         row_number() over ("
+        "             partition by mint order by observed_at, signature"
+        "         ) as rn"
+        "  from trade_ticks where is_buy = 1 and trader is not null"
+        ") ranked where rn <= ? limit ?",
+        per_mint, limit,
+    )
+    out: dict[str, list[str]] = {}
+    for row in rows:
+        buyers = out.setdefault(row["mint"], [])
+        # Distinct, order preserved: one wallet buying five times is one buyer,
+        # and counting it five times would inflate every cluster it lands in.
+        if row["trader"] not in buyers:
+            buyers.append(row["trader"])
+    return out
+
+
+async def ticks_for_mint(db: Database, mint: str, *, limit: int = 100_000) -> list[dict]:
+    return await db.fetch(
+        "select * from trade_ticks where mint = ? order by observed_at, signature limit ?",
+        mint, limit,
+    )
+
+
+async def open_paper_position(db: Database, *, mint: str, fields: dict) -> int:
+    await db.execute(
+        "insert into paper_positions ("
+        " mint, decision_id, mode, opened_at, status, bankroll_sol, size_pct, size_sol,"
+        " entry_at, entry_price_sol, entry_tick_sig, tokens_bought, entry_slippage_pct,"
+        " plan_tp_multiple, plan_trail_pct, plan_timeout_s, code_version, params"
+        ") values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        mint, fields.get("decision_id"), fields.get("mode", "PAPER"),
+        iso(fields["opened_at"]), "open", fields["bankroll_sol"], float(fields["size_pct"]),
+        fields["size_sol"], iso(fields.get("entry_at")), fields.get("entry_price_sol"),
+        fields.get("entry_tick_sig"), fields.get("tokens_bought"),
+        fields.get("entry_slippage_pct"), float(fields["plan_tp_multiple"]),
+        float(fields["plan_trail_pct"]), int(fields["plan_timeout_s"]),
+        fields["code_version"], dumps(fields.get("params")),
+    )
+    return await db.fetchval("select max(id) from paper_positions")
+
+
+async def close_paper_position(db: Database, position_id: int, fields: dict) -> None:
+    await db.execute(
+        "update paper_positions set status = 'closed', closed_at = ?, exit_reason = ?, "
+        "realised_sol = ?, fees_sol = ?, pnl_sol = ?, pnl_pct = ?, peak_price_sol = ?, "
+        "ticks_seen = ? where id = ?",
+        iso(fields.get("closed_at")), fields.get("exit_reason"), fields.get("realised_sol"),
+        fields.get("fees_sol"), fields.get("pnl_sol"),
+        None if fields.get("pnl_pct") is None else float(fields["pnl_pct"]),
+        fields.get("peak_price_sol"), fields.get("ticks_seen", 0), position_id,
+    )
+
+
+async def record_fill(db: Database, position_id: int, fields: dict) -> None:
+    await db.execute(
+        "insert into paper_fills ("
+        " position_id, kind, filled_at, tick_signature, quote_price_sol, fill_price_sol,"
+        " slippage_pct, tokens, gross_sol, fee_launchpad_sol, fee_priority_sol,"
+        " fee_tip_sol, fee_total_sol, net_sol"
+        ") values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        position_id, fields["kind"], iso(fields["filled_at"]), fields.get("tick_signature"),
+        fields.get("quote_price_sol"), fields.get("fill_price_sol"),
+        None if fields.get("slippage_pct") is None else float(fields["slippage_pct"]),
+        fields.get("tokens"), fields.get("gross_sol"), fields.get("fee_launchpad_sol"),
+        fields.get("fee_priority_sol"), fields.get("fee_tip_sol"),
+        fields.get("fee_total_sol"), fields.get("net_sol"),
+    )
+
+
+async def open_positions(db: Database) -> list[dict]:
+    return await db.fetch("select * from paper_positions where status = 'open'")
+
+
+async def paper_summary(db: Database) -> dict:
+    """What the journal says. Reported without commentary (part 0 rule 8).
+
+    Deliberately reports fees separately from PnL (1.10): without that split a
+    losing system reads as a winning one whose costs happen to be large.
+    """
+    row = await db.fetchrow(
+        "select count(*) as positions,"
+        "       sum(case when status = 'closed' then 1 else 0 end) as closed,"
+        "       sum(case when status = 'open' then 1 else 0 end) as still_open "
+        "from paper_positions"
+    ) or {}
+    closed = await db.fetch(
+        "select pnl_sol, fees_sol, size_sol, exit_reason, pnl_pct "
+        "from paper_positions where status = 'closed'"
+    )
+    pnls = [Decimal(r["pnl_sol"]) for r in closed if r.get("pnl_sol") is not None]
+    fees = [Decimal(r["fees_sol"]) for r in closed if r.get("fees_sol") is not None]
+    staked = [Decimal(r["size_sol"]) for r in closed if r.get("size_sol") is not None]
+    reasons: dict[str, int] = {}
+    for r in closed:
+        reasons[r.get("exit_reason") or "?"] = reasons.get(r.get("exit_reason") or "?", 0) + 1
+    wins = [p for p in pnls if p > 0]
+    row["net_pnl_sol"] = str(sum(pnls, Decimal(0)))
+    row["total_fees_sol"] = str(sum(fees, Decimal(0)))
+    row["total_staked_sol"] = str(sum(staked, Decimal(0)))
+    row["win_rate"] = (len(wins) / len(pnls)) if pnls else None
+    row["exit_reasons"] = reasons
+    # 3.9.6: no single trade above 20% of simulated profit.
+    gross_profit = sum(wins, Decimal(0))
+    row["largest_win_share"] = (
+        float(max(wins) / gross_profit) if wins and gross_profit > 0 else None
+    )
+    return row
+
+
+# -- structural facts (3.4 stage 1) ---------------------------------------
+
+async def record_structural(db: Database, *, mint: str, fields: dict) -> None:
+    """Store one structural probe.
+
+    Written even when the vendor returned nothing, because "asked and got
+    nothing" and "never asked" are different facts and stage 1 has to
+    distinguish them to keep saying `unfetched` honestly.
+    """
+    def flag(name: str):
+        value = fields.get(name)
+        return None if value is None else int(bool(value))
+
+    await db.execute(
+        "insert into token_structural ("
+        " mint, source, fetched_at, status_code, mintable, freezable, closable,"
+        " balance_mutable_authority, transfer_fee_upgradable, transfer_hook_upgradable,"
+        " metadata_mutable, default_account_state_upgradable, non_transferable,"
+        " transfer_hook, transfer_fee, malicious_address, fields_present, error, payload"
+        ") values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "on conflict (mint) do update set "
+        "  source = excluded.source, fetched_at = excluded.fetched_at,"
+        "  status_code = excluded.status_code, mintable = excluded.mintable,"
+        "  freezable = excluded.freezable, closable = excluded.closable,"
+        "  balance_mutable_authority = excluded.balance_mutable_authority,"
+        "  transfer_fee_upgradable = excluded.transfer_fee_upgradable,"
+        "  transfer_hook_upgradable = excluded.transfer_hook_upgradable,"
+        "  metadata_mutable = excluded.metadata_mutable,"
+        "  default_account_state_upgradable = excluded.default_account_state_upgradable,"
+        "  non_transferable = excluded.non_transferable,"
+        "  transfer_hook = excluded.transfer_hook, transfer_fee = excluded.transfer_fee,"
+        "  malicious_address = excluded.malicious_address,"
+        "  fields_present = excluded.fields_present, error = excluded.error,"
+        "  payload = excluded.payload",
+        mint, fields.get("source", "goplus"), iso(fields.get("fetched_at") or _now()),
+        fields.get("status_code"), flag("mintable"), flag("freezable"), flag("closable"),
+        flag("balance_mutable_authority"), flag("transfer_fee_upgradable"),
+        flag("transfer_hook_upgradable"), flag("metadata_mutable"),
+        flag("default_account_state_upgradable"), flag("non_transferable"),
+        fields.get("transfer_hook"), fields.get("transfer_fee"), flag("malicious_address"),
+        int(fields.get("fields_present") or 0), fields.get("error"),
+        dumps(fields.get("payload")),
+    )
+
+
+async def mints_needing_structural(db: Database, *, limit: int = 500) -> list[dict]:
+    """Mints with no structural probe yet, newest first.
+
+    Newest first on purpose: these facts are equally available at any age, but a
+    recent launch is the one a decision might still be made about.
+    """
+    return await db.fetch(
+        "select t.mint from tokens_seen t "
+        "left join token_structural s on s.mint = t.mint "
+        "where s.mint is null order by t.detected_at desc limit ?",
+        limit,
+    )
+
+
+async def structural_coverage(db: Database) -> dict:
+    total = await db.fetchval("select count(*) from tokens_seen") or 0
+    probed = await db.fetchval("select count(*) from token_structural") or 0
+    with_fields = await db.fetchval(
+        "select count(*) from token_structural where fields_present > 0"
+    ) or 0
+    flagged = await db.fetchval(
+        "select count(*) from token_structural where "
+        "coalesce(mintable,0)=1 or coalesce(freezable,0)=1 or coalesce(closable,0)=1 or "
+        "coalesce(balance_mutable_authority,0)=1 or coalesce(transfer_fee_upgradable,0)=1 or "
+        "coalesce(transfer_hook_upgradable,0)=1 or coalesce(metadata_mutable,0)=1 or "
+        "coalesce(default_account_state_upgradable,0)=1 or coalesce(non_transferable,0)=1"
+    ) or 0
+    return {"tokens": total, "probed": probed, "with_fields": with_fields,
+            "would_reject": flagged}
+
+
+# -- watch set and price paths (dense sampling) ---------------------------
+
+async def admit_to_watch_set(
+    db: Database, *, mint: str, cohort: str, first_seen: dt.datetime,
+    expires_at: dt.datetime, next_due_at: dt.datetime,
+) -> bool:
+    status = await db.execute(
+        "insert into watch_set (mint, cohort, admitted_at, expires_at, first_seen_at, "
+        "next_due_at) values (?,?,?,?,?,?) on conflict (mint) do nothing",
+        mint, cohort, iso(_now()), iso(expires_at), iso(first_seen), iso(next_due_at),
+    )
+    return not status.endswith(" 0")
+
+
+async def watch_set_counts(db: Database) -> dict[str, int]:
+    rows = await db.fetch(
+        "select cohort, count(*) as n from watch_set where state = 'active' group by cohort"
+    )
+    return {r["cohort"]: int(r["n"]) for r in rows}
+
+
+async def due_for_sampling(db: Database, *, limit: int, now: dt.datetime | None = None
+                           ) -> list[dict]:
+    """Active watch-set members whose next observation is due, oldest first.
+
+    Oldest-due first so a backlog drains in the order it accumulated rather than
+    starving whichever mints happen to sort last.
+    """
+    return await db.fetch(
+        "select * from watch_set where state = 'active' and next_due_at <= ? "
+        "order by next_due_at limit ?",
+        iso(now or _now()), limit,
+    )
+
+
+async def record_observation(db: Database, *, mint: str, fields: dict) -> bool:
+    status = await db.execute(
+        "insert into price_path ("
+        " mint, observed_at, scheduled_for, lateness_ms, source, status, venue_kind,"
+        " price_usd, price_native, liquidity_usd, fdv_usd, market_cap_usd, volume_m5,"
+        " volume_h1, txns_m5_buys, txns_m5_sells, pair_address, dex_id, age_seconds, payload"
+        ") values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "on conflict (mint, observed_at) do nothing",
+        mint, iso(fields["observed_at"]), iso(fields["scheduled_for"]),
+        int(fields.get("lateness_ms") or 0), fields["source"], fields["status"],
+        fields.get("venue_kind"), fields.get("price_usd"), fields.get("price_native"),
+        fields.get("liquidity_usd"), fields.get("fdv_usd"), fields.get("market_cap_usd"),
+        fields.get("volume_m5"), fields.get("volume_h1"), fields.get("txns_m5_buys"),
+        fields.get("txns_m5_sells"), fields.get("pair_address"), fields.get("dex_id"),
+        int(fields.get("age_seconds") or 0), dumps(fields.get("payload")),
+    )
+    return not status.endswith(" 0")
+
+
+async def advance_watch(
+    db: Database, *, mint: str, observed_at: dt.datetime,
+    next_due_at: dt.datetime | None, missed: bool = False,
+) -> None:
+    """Move a watch forward, or retire it when the cadence says it is done."""
+    if next_due_at is None:
+        await db.execute(
+            "update watch_set set state = 'expired', last_observed_at = ?, "
+            "next_due_at = null, observations = observations + ? , misses = misses + ? "
+            "where mint = ?",
+            iso(observed_at), 0 if missed else 1, 1 if missed else 0, mint,
+        )
+        return
+    await db.execute(
+        "update watch_set set last_observed_at = ?, next_due_at = ?, "
+        "observations = observations + ?, misses = misses + ? where mint = ?",
+        iso(observed_at), iso(next_due_at), 0 if missed else 1, 1 if missed else 0, mint,
+    )
+
+
+async def path_for_mint(db: Database, mint: str, *, limit: int = 100_000) -> list[dict]:
+    return await db.fetch(
+        "select * from price_path where mint = ? order by observed_at limit ?", mint, limit
+    )
+
+
+async def sampler_stats(db: Database, hours: float = 24) -> dict:
+    cutoff = _cutoff(hours)
+    counts = await watch_set_counts(db)
+    obs = await db.fetchval(
+        "select count(*) from price_path where observed_at >= ?", cutoff) or 0
+    by_status = {
+        r["status"]: int(r["n"]) for r in await db.fetch(
+            "select status, count(*) as n from price_path where observed_at >= ? "
+            "group by status", cutoff)
+    }
+    backlog = await db.fetchval(
+        "select count(*) from watch_set where state = 'active' and next_due_at <= ?",
+        iso(_now())) or 0
+    late = await db.fetch(
+        "select lateness_ms from price_path where observed_at >= ? and lateness_ms > 0",
+        cutoff)
+    return {
+        "cohorts": counts,
+        "watch_set": sum(counts.values()),
+        "observations": obs,
+        "observations_per_min": obs / (hours * 60) if hours else 0,
+        "by_status": by_status,
+        "backlog": backlog,
+        "lateness_ms": percentiles([int(r["lateness_ms"]) for r in late]),
+    }
+
+
+# -- structural events ------------------------------------------------------
+
+async def record_structural_event(db: Database, *, mint: str, fields: dict) -> bool:
+    status = await db.execute(
+        "insert into structural_events ("
+        " mint, event_type, detected_at, observed_at, derived_from, before_value,"
+        " after_value, delta_pct, severity, payload"
+        ") values (?,?,?,?,?,?,?,?,?,?) "
+        "on conflict (mint, event_type, detected_at) do nothing",
+        mint, fields["event_type"], iso(fields["detected_at"]), iso(fields["observed_at"]),
+        fields["derived_from"], fields.get("before_value"), fields.get("after_value"),
+        None if fields.get("delta_pct") is None else float(fields["delta_pct"]),
+        fields.get("severity"), dumps(fields.get("payload")),
+    )
+    return not status.endswith(" 0")
+
+
+async def events_for_mint(db: Database, mint: str) -> list[dict]:
+    return await db.fetch(
+        "select * from structural_events where mint = ? order by detected_at", mint
+    )
+
+
+async def mints_with_paths(db: Database, *, cohort: str | None = None,
+                           limit: int = 10_000) -> list[dict]:
+    if cohort:
+        return await db.fetch(
+            "select w.mint, w.cohort from watch_set w where w.cohort = ? "
+            "and exists (select 1 from price_path p where p.mint = w.mint) limit ?",
+            cohort, limit)
+    return await db.fetch(
+        "select w.mint, w.cohort from watch_set w "
+        "where exists (select 1 from price_path p where p.mint = w.mint) limit ?", limit)
+
+
+async def load_path_and_events(db: Database, mint: str) -> tuple[list[dict], list[dict]]:
+    """Everything the exit engine replays for one mint."""
+    return (await path_for_mint(db, mint), await events_for_mint(db, mint))
+
+
+async def mints_awaiting_admission(
+    db: Database, *, limit: int, max_age_seconds: int, now: dt.datetime | None = None
+) -> list[dict]:
+    """Recent mints with no watch-set row yet, newest first.
+
+    The sampler PULLS from here rather than the stream pushing to it. That is
+    what keeps the two decoupled: the stream writes tokens_seen and knows
+    nothing about sampling, and if the sampler is down the only consequence is
+    that admissions resume when it comes back.
+
+    Bounded by age because admitting a token already past `max_age_seconds`
+    would consume a watch-set slot for something the cadence would retire on its
+    first observation.
+
+    `accepted` reports whether the cascade accepted the mint, which is what the
+    `filtered` cohort keys on. Control-cohort mints ignore it entirely.
+
+    A mint that was considered and NOT admitted stays in this result on later
+    ticks, deliberately: `decide` may accept it after the sampler first saw it,
+    and dropping it permanently would mean the filtered arm could only ever
+    admit mints that happened to be decided before their first sampler tick.
+    The age bound is what keeps the reconsidered set from growing without limit.
+    """
+    now = now or _now()
+    cutoff = iso(now - dt.timedelta(seconds=max_age_seconds))
+    return await db.fetch(
+        "select t.mint, t.detected_at, t.block_time, "
+        "       case when d.outcome = 'accept' then 1 else 0 end as accepted "
+        "from tokens_seen t "
+        "left join watch_set w on w.mint = t.mint "
+        "left join decisions d on d.mint = t.mint "
+        "where w.mint is null and t.detected_at >= ? "
+        "order by t.detected_at desc limit ?",
+        cutoff, limit,
+    )

@@ -91,6 +91,16 @@ class Config:
     label_peak_multiple: float
     decide_creator_min_mints: int
     decide_creator_max_rug_rate: float
+    decide_min_liquidity_usd: float
+    decide_hold_horizon_seconds: int
+    decide_max_dev_pct: float
+    decide_max_snipers: int
+    decide_max_insiders: int
+    decide_max_bundler_pct: float
+    decide_max_bundler_count: int
+    decide_cold_start_seconds: int
+    decide_max_cluster_pct: float
+    label_set_path: str
     log_level: str = field(default="INFO")
 
     @staticmethod
@@ -150,6 +160,24 @@ class Config:
             label_peak_multiple=_get_float("TRENCHES_LABEL_PEAK_MULTIPLE", 2.0),
             decide_creator_min_mints=_get_int("TRENCHES_DECIDE_CREATOR_MIN_MINTS", 3),
             decide_creator_max_rug_rate=_get_float("TRENCHES_DECIDE_CREATOR_MAX_RUG_RATE", 0.6),
+            # UNCALIBRATED (3.4 gives no liquidity number). Overridable from the
+            # environment precisely so tuning it is a recorded, deliberate act --
+            # `thresholds()` snapshots whatever it ends up being into every row.
+            decide_min_liquidity_usd=_get_float("TRENCHES_DECIDE_MIN_LIQUIDITY_USD", 5000.0),
+            decide_hold_horizon_seconds=_get_int("TRENCHES_DECIDE_HOLD_HORIZON_SECONDS", 6 * 3600),
+            # Stage 4. These five ARE 3.4's stated numbers, unlike the floor above.
+            decide_max_dev_pct=_get_float("TRENCHES_DECIDE_MAX_DEV_PCT", 5.0),
+            decide_max_snipers=_get_int("TRENCHES_DECIDE_MAX_SNIPERS", 20),
+            decide_max_insiders=_get_int("TRENCHES_DECIDE_MAX_INSIDERS", 20),
+            decide_max_bundler_pct=_get_float("TRENCHES_DECIDE_MAX_BUNDLER_PCT", 15.0),
+            decide_max_bundler_count=_get_int("TRENCHES_DECIDE_MAX_BUNDLER_COUNT", 100),
+            # Below this age a behavioural zero is a cold start, not a clean
+            # result, and every stage-4 rule passes on zero (Part 2).
+            decide_cold_start_seconds=_get_int("TRENCHES_DECIDE_COLD_START_SECONDS", 600),
+            # Stage 5. 15% IS 3.4's number. The label set below is what decides
+            # whether it may fire at all -- see decide/labels.py.
+            decide_max_cluster_pct=_get_float("TRENCHES_DECIDE_MAX_CLUSTER_PCT", 15.0),
+            label_set_path=_get("TRENCHES_LABEL_SET_PATH", ""),
             log_level=_get("TRENCHES_LOG_LEVEL", "INFO"),
         )
         if cfg.workers < 1:
