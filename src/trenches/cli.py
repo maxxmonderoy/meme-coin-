@@ -917,6 +917,178 @@ async def cmd_idl_check(cfg: Config, args: argparse.Namespace) -> int:
     return worst
 
 
+async def cmd_analyze(cfg: Config, args: argparse.Namespace) -> int:
+    """One coin in, four answers out: enter, size, take profit, stop.
+
+    Composes what already exists rather than adding a new opinion: the cascade
+    decides, the last price-path observation measures the pool, and 1.9 and 1.10
+    turn those into numbers for THIS coin. Everything it could not check is
+    printed, because a clean report over four unfetched stages looks identical
+    to a clean one over four checked stages unless the difference is on screen.
+    """
+    from decimal import Decimal
+
+    from . import advise
+    from .decide import (
+        UNSUPPLIED,
+        Cascade,
+        attach_first_buyers,
+        load_labels,
+        missing_from,
+    )
+
+    labels = load_labels(cfg.label_set_path or None)
+    db = await pool_mod.connect(cfg.dsn)
+    try:
+        token = await repo.get_token(db, args.mint)
+        if token is None:
+            print(f"{args.mint}: not in the journal.\n")
+            print("  Nothing has been collected for this mint, so there is nothing to")
+            print("  analyse. Run `trenches stream` to ingest launches, or pass a mint")
+            print("  this system has already seen.")
+            return 1
+
+        derived = await repo.load_funder_labels(db)
+        if derived["addresses"]:
+            labels = labels.with_shared_funders(derived["addresses"], derived["source"])
+
+        path = await repo.path_for_mint(db, args.mint)
+        events = await repo.events_for_mint(db, args.mint)
+        buyers = (await repo.first_buyers(db)).get(args.mint)
+
+        # Stage 3 and the pool measurement both want the newest observation that
+        # actually carried a liquidity figure -- not simply the newest row.
+        latest = next(
+            (r for r in reversed(path) if r.get("liquidity_usd") is not None), None
+        )
+        liquidity = advise.to_decimal(latest["liquidity_usd"]) if latest else None
+
+        facts = attach_first_buyers(dict(token), buyers)
+        facts.setdefault("mint", args.mint)
+        facts["excluded_addresses"] = [
+            a for a in (token.get("bonding_curve"),
+                        (latest or {}).get("pair_address")) if a
+        ]
+        if liquidity is not None:
+            facts["liquidity_usd"] = str(liquidity)
+            facts["liquidity_observed_at"] = latest["observed_at"]
+        if any(e["event_type"] == "rugged" for e in events):
+            facts["rugged"] = True
+
+        cascade = Cascade(
+            min_mints=cfg.decide_creator_min_mints,
+            max_rug_rate=cfg.decide_creator_max_rug_rate,
+            min_liquidity_usd=cfg.decide_min_liquidity_usd,
+            hold_horizon_seconds=cfg.decide_hold_horizon_seconds,
+            max_dev_pct=cfg.decide_max_dev_pct,
+            max_snipers=cfg.decide_max_snipers,
+            max_insiders=cfg.decide_max_insiders,
+            max_bundler_pct=cfg.decide_max_bundler_pct,
+            max_bundler_count=cfg.decide_max_bundler_count,
+            cold_start_seconds=cfg.decide_cold_start_seconds,
+            max_cluster_pct=cfg.decide_max_cluster_pct,
+            labels=labels,
+        )
+        verdict, trail = cascade.run(facts)
+        gaps = {k: UNSUPPLIED[k] for k in missing_from(facts)}
+    finally:
+        await db.close()
+
+    advice = advise.build(
+        mint=args.mint, verdict=verdict, trail=trail, liquidity_usd=liquidity,
+        bankroll=Decimal(str(args.bankroll)) if args.bankroll else None,
+        size_pct=Decimal(str(args.size_pct)),
+        unchecked=gaps,
+        observed={
+            "detected_at": token.get("detected_at"),
+            "launchpad": token.get("launchpad"),
+            "symbol": token.get("symbol"),
+            "path_points": len(path),
+            "structural_events": len(events),
+            "liquidity_observed_at": (latest or {}).get("observed_at"),
+            "first_buyers_seen": len(buyers or []),
+        },
+    )
+    _print_advice(advice)
+    return 0 if advice.verdict != advise.REJECT else 2
+
+
+def _print_advice(a) -> None:
+    money = lambda v: "unknown" if v is None else f"${v:,.2f}"   # noqa: E731
+
+    print(f"\n{'=' * 72}")
+    print(f"  {a.mint}")
+    if a.observed.get("symbol"):
+        print(f"  {a.observed['symbol']}  ({a.observed.get('launchpad') or 'unknown venue'})")
+    print(f"{'=' * 72}\n")
+
+    print(f"VERDICT   {a.verdict}")
+    print(f"          {a.verdict_reason}\n")
+
+    print("  stage  outcome    data")
+    for s in a.stages:
+        state = "accept" if s.accepted else "REJECT"
+        data = "read" if s.had_data else f"NONE ({s.note})"
+        print(f"    {s.stage}    {state:<9}  {data}")
+    print(f"\n  {a.checked_stages} of {len(a.stages)} stages had something to read.")
+
+    size = a.size
+    print(f"\n{'-' * 72}\nSIZE\n")
+    print(f"  recommended        {money(size.recommended)}")
+    print(f"  1.9 bankroll cap   {money(size.bankroll_cap)}   ({size.size_pct}% of bankroll)")
+    print(f"  pool cap           {money(size.depth_cap)}   "
+          f"(exit impact <= {size.target_exit_impact:.1%})")
+    print(f"  no-counterparty    {money(size.hard_depth_cap)}   "
+          f"(beyond this there is no fill at any price)")
+    print(f"  binding constraint {size.binding.upper()}")
+    print(f"\n  {size.note}.")
+
+    tp = a.take_profit
+    print(f"\n{'-' * 72}\nTAKE PROFIT\n")
+    print(f"  {tp.fraction:.0%} of the position at {tp.multiple}x"
+          "  (1.10: original stake off at 2x)")
+    print(f"  then a {tp.trail_pct:.0%} trailing stop on the remainder, rest rides free")
+    if tp.exit_value_at_tp is not None:
+        verdict_word = "yes" if tp.exitable else "NO -- partial fill only"
+        print(f"\n  selling {money(tp.exit_value_at_tp)} at target costs "
+              f"{tp.impact_at_tp:.2%} impact; exitable: {verdict_word}")
+    print(f"\n  {tp.note}.")
+
+    stop = a.stop
+    print(f"\n{'-' * 72}\nSTOP\n")
+    print("  STRUCTURAL FIRST -- these fire before the price move completes:")
+    for trigger in stop.structural:
+        print(f"    - {trigger}")
+    print(f"\n  price stop         -{stop.price_stop_pct:.0%} from peak")
+    if stop.realised_at_stop_pct is not None:
+        print(f"  actually realised  -{stop.realised_at_stop_pct:.1%} after impact "
+              f"at today's depth")
+    print(f"  time stop          {stop.time_stop_seconds // 60} min "
+          f"(1.2: median rugged lifespan ~14 min; 1.5: 85% of the profitable "
+          f"sniper cohort is out in 5)")
+    print(f"\n  {stop.note}.")
+
+    print(f"\n{'-' * 72}\nWHAT THIS DID NOT CHECK\n")
+    if a.unchecked:
+        for key, why in sorted(a.unchecked.items()):
+            print(f"  {key:<34} {why}")
+    else:
+        print("  nothing: every fact the cascade reads was supplied.")
+
+    print(f"\n  observed: {a.observed.get('path_points', 0)} price points, "
+          f"{a.observed.get('structural_events', 0)} structural events, "
+          f"{a.observed.get('first_buyers_seen', 0)} first buyers")
+    if a.observed.get("liquidity_observed_at"):
+        print(f"  liquidity read at {a.observed['liquidity_observed_at']}")
+
+    print(f"\n{'=' * 72}")
+    print("  THIS IS NOT A BUY SIGNAL. The cascade removes known disqualifiers;")
+    print("  it does not establish an edge. 1.9: a single trade on the realistic")
+    print("  distribution is about -5% gross and -7.85% after a 3% round trip,")
+    print("  and Kelly for a negative-edge game is f* ~ 0. The decision is yours.")
+    print(f"{'=' * 72}\n")
+
+
 async def cmd_funders(cfg: Config, args: argparse.Namespace) -> int:
     """Derive shared-funder labels from our own funding graph. No vendor.
 
@@ -1499,6 +1671,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="delete all but the newest N backups in that directory")
 
     sub.add_parser("idl-check", help="diff the vendored IDL against upstream")
+    analyze = sub.add_parser(
+        "analyze", help="one coin: enter, size, take profit, stop")
+    analyze.add_argument("mint")
+    analyze.add_argument("--bankroll", type=float, default=None,
+                         help="speculative bankroll, for 1.9's 1-2%% hard cap")
+    analyze.add_argument("--size-pct", type=float, default=1.0,
+                         help="percent of bankroll per position (1.9 hard cap: 2)")
+
     funders = sub.add_parser(
         "funders", help="derive shared-funder labels from the funding graph (no vendor)")
     funders.add_argument(
@@ -1519,7 +1699,7 @@ HANDLERS = {
     "sample": cmd_sample,
     "backup": cmd_backup,
     "replay-exits": cmd_replay_exits,
-    "idl-check": cmd_idl_check, "prune": cmd_prune, "funders": cmd_funders,
+    "idl-check": cmd_idl_check, "prune": cmd_prune, "funders": cmd_funders, "analyze": cmd_analyze,
     "label": cmd_label, "rules-report": cmd_rules_report, "gate": cmd_gate,
     "decide": cmd_decide, "rugs": cmd_rugs,
 }

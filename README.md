@@ -220,6 +220,45 @@ watchdog can catch it, a live feed sends a clean EOF, four failures fire in a
 row to test bounded backoff, and events are replayed to prove dedupe. A soak
 says "nothing went wrong"; this says "we made it go wrong and nothing was lost".
 
+## One coin in, four answers out
+
+```bash
+trenches analyze <mint> --bankroll 2000
+```
+
+Enter, size, take profit, stop — for one coin, composed from what the cascade,
+the pool observation and the event timeline already know. It refuses three
+things, and the refusals are the design:
+
+**1. It never says "enter."** The cascade removes disqualifiers; it does not find
+edge. §1.9 is explicit that a single trade on the realistic distribution is about
+−5% gross and −7.85% after a 3% round trip, and Kelly for a negative-edge game is
+f\* ≈ 0. So the verdict is `REJECT`, `NO DISQUALIFIER`, or `INSUFFICIENT DATA` —
+and today the third is the honest answer for almost everything, because most
+stages have nothing to read.
+
+**2. It never hides what it could not check.** A clean report over four unfetched
+stages looks identical to a clean one over four checked stages unless the
+difference is printed, and Part 2 names reading empty as clean the most expensive
+mistake available. Every run ends with the gap list and a `2 of 6 stages had
+something to read` line.
+
+**3. The stop is structural first, price second.** A price stop assumes a bid.
+On a token with $6,000 of liquidity mid-rug there is no bid — the stop fills far
+below where it triggered, or not at all. The triggers that fire *before* the
+price move completes (liquidity collapse, `rugged` flipping true, the pool
+disappearing) are the half a price-only stop-loss cannot give you.
+
+**The pool often caps the position, not the bankroll.** §1.9 says 1–2% of
+speculative bankroll and says nothing about whether the position can be *sold*.
+Sizing runs both caps and names the binding one — on a $6,200 pool, a $500k
+bankroll is capped at **$63**, not $5,000, because that is the largest position
+whose exit costs under 2% impact. "I sized small" and "I could not have got out
+of anything bigger" are different facts.
+
+Exit codes: `0` no disqualifier or insufficient data, `2` rejected, `1` unknown
+mint.
+
 ## The cascade, stages 0-5 (paper only)
 
 ```bash
