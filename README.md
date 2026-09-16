@@ -46,15 +46,38 @@ on your PATH otherwise.
 
 ### Collecting
 
-```bash
-trenches stream --record captures/   # dual free feeds + paper positions
-trenches exits                       # exit loop, its own process (§3.1)
-trenches sample                      # dense price paths, its own process
-trenches structural --limit 200      # stage-1 structural facts (free, keyless)
+One command starts all three and leaves them running after you close the
+terminal:
+
+```zsh
+./scripts/collectors.sh start
+./scripts/collectors.sh status
+./scripts/collectors.sh logs
+./scripts/collectors.sh stop
 ```
 
-Run `stream`, `exits` and `sample` in separate terminals. They share only the
-database — that is the point, and an entry-side stall must not stop an exit.
+It calls `.venv/bin/trenches` directly, so it works whether or not the venv is
+activated — `command not found: trenches` is what happens when it is not, and
+that is not worth hitting twice. Logs go to `logs/<name>.log` and survive the
+terminal closing. `logs` follows all three at once; ctrl-C stops watching, not
+collecting.
+
+**On a Mac, closing the lid still sleeps the machine and the collectors stop
+with it.** To leave it running for days, keep it plugged in and run
+`caffeinate -dimsu` in a terminal you can leave open. The script says so on
+startup.
+
+They are three processes because §3.1 says so: an entry-side stall must never
+stop an exit loop. They share only the database.
+
+To run one by hand instead:
+
+```zsh
+.venv/bin/trenches stream --record captures/
+.venv/bin/trenches exits
+.venv/bin/trenches sample
+.venv/bin/trenches structural --limit 200
+```
 
 ### Looking at what you collected
 

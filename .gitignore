@@ -49,6 +49,9 @@ build/
 data/
 captures/
 logs/
+
+# PID files for the collector processes (scripts/collectors.sh).
+.run/
 *.log
 
 # --- tooling ------------------------------------------------------------
