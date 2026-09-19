@@ -44,7 +44,44 @@ Without activating the venv, prefix every command with `.venv/bin/` instead:
 `.venv/bin/trenches migrate`. The console script is installed there and is not
 on your PATH otherwise.
 
-### Collecting
+### Windows
+
+```powershell
+git clone https://github.com/maxxmonderoy/meme-coin-.git
+cd meme-coin-
+py -3 -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\pip install -e . --no-deps
+copy .env.example trenches.local.conf
+.venv\Scripts\trenches migrate
+```
+
+Then start the collectors:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\collectors.ps1 start
+powershell -ExecutionPolicy Bypass -File .\scripts\collectors.ps1 status
+powershell -ExecutionPolicy Bypass -File .\scripts\collectors.ps1 stop
+```
+
+**`-ExecutionPolicy Bypass` is not optional.** Windows blocks unsigned `.ps1`
+files by default and the error it gives does not say so clearly.
+
+**Sleep stops collection**, and it is the failure that silently costs a whole
+week — you come back to six hours of data. In Settings → System → Power &
+battery, set *When plugged in, put my device to sleep* to **Never**, and on a
+laptop set *When I close the lid* to **Do nothing**. Being plugged in is not
+enough on its own.
+
+Logs land in `logs\<name>.log` and `logs\<name>.err.log` — split because
+`Start-Process` refuses to send both streams to one file. `status` reads the
+error log first, since that is where a crash lands.
+
+No dependency here is platform-specific, and the pinned hashes cover Windows
+wheels. If `--require-hashes` ever rejects one, that is a real finding worth
+reporting rather than working around.
+
+### Collecting (macOS / Linux)
 
 One command starts all three and leaves them running after you close the
 terminal:
