@@ -46,10 +46,15 @@ on your PATH otherwise.
 
 ### Windows
 
+**Python 3.11 or 3.12 — not 3.13.** `pyproject.toml` pins
+`requires-python = ">=3.11,<3.13"`, and python.org's download button gives you
+the newest release, which is past that. Check with `py --version`, and if it is
+too new install 3.12 alongside it and build the venv with `py -3.12`.
+
 ```powershell
 git clone https://github.com/maxxmonderoy/meme-coin-.git
 cd meme-coin-
-py -3 -m venv .venv
+py -3.12 -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 .venv\Scripts\pip install -e . --no-deps
 copy .env.example trenches.local.conf
@@ -77,9 +82,14 @@ Logs land in `logs\<name>.log` and `logs\<name>.err.log` — split because
 `Start-Process` refuses to send both streams to one file. `status` reads the
 error log first, since that is where a crash lands.
 
-No dependency here is platform-specific, and the pinned hashes cover Windows
-wheels. If `--require-hashes` ever rejects one, that is a real finding worth
-reporting rather than working around.
+No dependency here is platform-specific, but `requirements.txt` is compiled on
+Linux and that is not the same thing. `pytest` declares
+`colorama>=0.4 ; sys_platform == "win32"`, which the Linux compile never emits,
+so on Windows pip found an unpinned transitive dependency and refused the
+**entire** install under `--require-hashes`. `colorama` is now pinned by hand
+with a `win32` marker and a comment saying a recompile on Linux will drop it
+again. If `--require-hashes` rejects something else, that is the same class of
+bug — report it rather than working around it.
 
 ### Collecting (macOS / Linux)
 
