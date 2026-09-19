@@ -77,6 +77,15 @@ certifi==2026.7.22 \
     # via
     #   httpcore
     #   httpx
+colorama==0.4.6 ; sys_platform == 'win32' \
+    --hash=sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44 \
+    --hash=sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6
+    # via pytest
+    # NOT produced by the uv compile above: that ran on Linux, where pytest's
+    # `colorama>=0.4 ; sys_platform == "win32"` marker is false, so the pin was
+    # never emitted. On Windows pip then found an unpinned transitive dependency
+    # and refused the WHOLE install under --require-hashes. Pinned by hand from
+    # PyPI's published digests for 0.4.6; recompiling on Linux will drop it again.
 grpcio==1.83.0 \
     --hash=sha256:009667eaf3dcd5224c713589cdc98e7ca4ed0ff0b61132c6b276e930eb83a2df \
     --hash=sha256:10b3fa0475eb572c9a81a6fe37fa16a9c500c0c91cfc148cac15692b7e3c2867 \

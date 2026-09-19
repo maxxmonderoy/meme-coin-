@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import datetime as dt
 import json
 import signal
 import sys
@@ -84,15 +85,61 @@ async def cmd_stream(cfg: Config, args: argparse.Namespace) -> int:
     logmod.kv(log, 20, "stream opened", stream_id=stream_id, feeds=list(factories),
               dialect=db.dialect, retention=cfg.retention, code_version=code_version())
 
-    ingest = Ingest(db, cfg, stream_id, recorder=recorder)
+    paper_runner = cascade = None
+    if args.paper:
+        from decimal import Decimal
+
+        from .decide import Cascade
+        from .paper.fees import FeeModel
+        from .paper.runner import PaperRunner
+        from .paper.simulator import ExitPlan
+
+        cascade = Cascade(min_mints=cfg.decide_creator_min_mints,
+                          max_rug_rate=cfg.decide_creator_max_rug_rate)
+        # The runner holds the PumpPortal consumer so opening a position
+        # subscribes to that mint's trades on the SHARED socket (3.2).
+        tracker = next(
+            (c for c in probes.values() if c.provider == "pumpportal"), None
+        )
+        paper_runner = PaperRunner(
+            db, bankroll_sol=Decimal(str(args.bankroll)),
+            size_pct=Decimal(str(args.size_pct)),
+            plan=ExitPlan(), model=FeeModel(), tracker=tracker,
+        )
+        if tracker is None:
+            log.warning(
+                "paper is on but PumpPortal is not among the feeds; positions will be "
+                "armed and never priced, because nothing subscribes to their trades"
+            )
+
+    ingest = Ingest(db, cfg, stream_id, recorder=recorder,
+                    paper=paper_runner, cascade=cascade)
     mux = FeedMultiplexer(
         factories, backoff_min=cfg.backoff_min_seconds, backoff_max=cfg.backoff_max_seconds,
         on_reconnect=lambda feed, n, reason: ingest.health.record_reconnect(feed),
     )
 
-    workers = [asyncio.create_task(ingest.worker(f"w{i}"), name=f"worker-{i}")
+    workers = [asyncio.create_task(ingest.worker(f"w{i}", i), name=f"worker-{i}")
                for i in range(cfg.workers)]
     flusher = asyncio.create_task(ingest.health_flusher(), name="health")
+
+    async def _safety_sweep() -> None:
+        """In-process backstop only.
+
+        3.1 wants the exit loop in its own process and `trenches exits` is that.
+        This exists so a single-process run does not leave bags open, and it is
+        deliberately NOT a substitute: if this process stalls, so does this
+        sweep, which is the whole failure 3.1 is describing.
+        """
+        while paper_runner is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(asyncio.sleep(30)), timeout=31)
+            except (TimeoutError, asyncio.CancelledError):
+                return
+            with contextlib.suppress(Exception):
+                await paper_runner.sweep_timeouts()
+
+    sweeper = asyncio.create_task(_safety_sweep(), name="safety-sweep")
     consume = asyncio.create_task(ingest.consume(mux.run()), name="consume")
 
     # The labeler runs as a SIBLING with its own database connection, never
@@ -131,11 +178,14 @@ async def cmd_stream(cfg: Config, args: argparse.Namespace) -> int:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await consume
         with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(ingest.queue.join(), timeout=10)
+            await asyncio.wait_for(ingest.join(), timeout=10)
         ingest.stop()
         for w in workers:
             w.cancel()
         flusher.cancel()
+        sweeper.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await sweeper
         if label_task is not None:
             label_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -149,7 +199,9 @@ async def cmd_stream(cfg: Config, args: argparse.Namespace) -> int:
         await repo.close_stream(db, stream_id, stop_reason)
         await db.close()
         logmod.kv(log, 20, "stream closed", stream_id=stream_id, reason=stop_reason,
-                  dropped=ingest.dropped, dedupe_hits=ingest.dedupe.hits)
+                  dropped=ingest.dropped, dedupe_hits=ingest.dedupe.hits,
+                  ticks_stored=ingest.ticks_stored, decisions=ingest.decisions_made,
+                  armed=ingest.armed)
     return 0
 
 
@@ -161,6 +213,10 @@ async def cmd_stats(cfg: Config, args: argparse.Namespace) -> int:
         data = await repo.stats(db, hours=args.hours)
         coverage = await repo.outcome_coverage(db, HORIZONS)
         due = {h: await repo.due_count(db, h, HORIZON_SECONDS[h]) for h in HORIZONS}
+        # Fetched here, with the connection still open: a horizon observed hours
+        # late is indistinguishable in the report from one observed on time, and
+        # the two mean entirely different things.
+        horizon_lateness = await repo.lateness_by_horizon(db, HORIZONS)
     finally:
         await db.close()
 
@@ -181,8 +237,14 @@ async def cmd_stats(cfg: Config, args: argparse.Namespace) -> int:
     # The 3.8.8 canary: a rate, not a total. A feed that broke an hour ago has
     # a healthy-looking total and a current rate of zero.
     if minutes:
-        print(f"\n  DETECTION RATE     {creates / minutes:>9.2f} creates/min"
-              f"   ({events / minutes:,.1f} events/min)")
+        unique = int(data.get("unique_mints") or 0)
+        unique_rate = unique / minutes if minutes else 0.0
+        print(f"\n  DETECTION RATE     {unique_rate:>9.2f} unique mints/min"
+              f"   (~{unique_rate * 1440:,.0f}/day)")
+        print(f"    feed sightings   {creates / minutes:>9.2f} /min across all feeds "
+              f"({events:,} events)")
+        print("    the two differ because both feeds see the same launch; only the")
+        print("    first line is a detection rate")
         if creates == 0:
             print("  ** zero creates across the whole window -- check the feeds and the")
             print("     schema mismatch count, not just the error count (3.8.8)")
@@ -203,18 +265,60 @@ async def cmd_stats(cfg: Config, args: argparse.Namespace) -> int:
                   f"creates={int(row['creates']):>7,} stale={int(row['stale']):>4} "
                   f"mismatch={int(row['mismatches']):>4} reconnects={int(row['reconnects']):>4}")
 
-    race = data.get("feed_race") or []
-    if race:
-        total = sum(int(r["wins"]) for r in race) or 1
-        print("\n  FEED RACE -- who saw each mint first (3.2 upgrade trigger 2 evidence):")
-        for row in race:
-            wins = int(row["wins"])
+    sampler = data.get("sampler")
+    if sampler and sampler.get("watch_set"):
+        from .label.dexscreener import BATCH_SIZE, RATE_LIMIT_PER_MINUTE
+        from .sample.cadence import compute_budget
+
+        budget = compute_budget(batch_size=BATCH_SIZE,
+                                requests_per_minute=RATE_LIMIT_PER_MINUTE)
+        watching = int(sampler["watch_set"])
+        obs_min = float(sampler.get("observations_per_min") or 0)
+        print("\n  SAMPLER")
+        print(f"    watch set          {watching:,} / {budget.watch_set_max:,} "
+              f"({watching / budget.watch_set_max:.0%} of derived capacity)")
+        for cohort, n in sorted((sampler.get("cohorts") or {}).items()):
+            print(f"      {cohort:<16} {int(n):,}")
+        print(f"    observations/min   {obs_min:,.1f} / "
+              f"{budget.observations_per_minute:,} "
+              f"({obs_min / budget.observations_per_minute:.0%} of budget)")
+        print(f"    backlog due now    {int(sampler.get('backlog') or 0):,}")
+        by_status = sampler.get("by_status") or {}
+        if by_status:
+            print(f"    by status          {by_status}")
+        if by_status.get("not_yet_indexed"):
+            print("      not_yet_indexed is the cold start, NOT a death signal")
+        lateness = sampler.get("lateness_ms") or {}
+        if lateness:
+            print(f"    lateness           p50 {lateness.get('p50')}ms "
+                  f"p90 {lateness.get('p90')}ms")
+
+    race = data.get("feed_race") or {}
+    feeds = race.get("feeds") or []
+    if feeds:
+        mints = race.get("mints") or 0
+        print(f"\n  FEED RACE over {mints:,} mint(s) "
+              f"-- {race.get('contested', 0):,} contested, {race.get('sole', 0):,} "
+              "seen by one feed only")
+        print("    (3.2 upgrade trigger 2 evidence)")
+        for row in feeds:
             d = row.get("delta_ms") or {}
-            lead = (f"lead over the other feed: p50 {d.get('p50')}ms p90 {d.get('p90')}ms"
-                    if d else "no head-to-head samples yet")
-            print(f"    {row['first_feed']:<14} {wins:>7,} wins ({wins / total:>5.1%})  {lead}")
-        print("\n  Read this before ever paying for a faster feed: a feed that never wins,")
-        print("  or wins by milliseconds you cannot act on, is not worth upgrading.")
+            rate = row.get("contested_win_rate")
+            print(f"    {row['feed']:<14} first on {row['first_sightings']:>7,} mint(s)")
+            if rate is not None:
+                print(f"      contested      won {row['contested_wins']:>7,} of "
+                      f"{row['contested_wins'] + row['contested_losses']:,} "
+                      f"({rate:.0%})"
+                      + (f"  lead p50 {d.get('p50')}ms p90 {d.get('p90')}ms" if d else ""))
+            if row["sole_sightings"]:
+                print(f"      SOLE           {row['sole_sightings']:>7,} mint(s) "
+                      f"({row['sole_share']:.0%} of all) no other feed ever "
+                      "delivered")
+        print("\n  Read the two lines separately. A contested win rate is about LATENCY;")
+        print("  sole sightings are about COVERAGE, and a feed that contributes mostly")
+        print("  sole sightings cannot be dropped no matter how slow it is. Before")
+        print("  paying for a faster feed, check that the one you have is losing races")
+        print("  it actually entered -- not simply missing launches.")
 
     total_rows = sum(v["observed"] for v in coverage["horizons"].values())
     print(f"\n  OUTCOME LABELING -- {total_rows:,} observations over "
@@ -223,6 +327,17 @@ async def cmd_stats(cfg: Config, args: argparse.Namespace) -> int:
         bucket = coverage["horizons"][horizon]
         split = " ".join(f"{k}={v:,}" for k, v in sorted(bucket["status"].items())) or "-"
         venue = " ".join(f"{k}={v:,}" for k, v in sorted(bucket["venue"].items())) or "-"
+        late = (horizon_lateness or {}).get(horizon) or {}
+        if late.get("n"):
+            p50 = late.get("p50") or 0
+            marker = "  ** " if p50 > HORIZON_SECONDS[horizon] else "     "
+            print(f"{marker}lateness p50 {p50:,}s p90 {late.get('p90') or 0:,}s  "
+                  f"on-time {late['on_time']:,}/{late['n']:,}")
+            if p50 > HORIZON_SECONDS[horizon]:
+                print(f"         median observation is later than the {horizon} horizon "
+                      "itself --")
+                print("         these rows say what the token looked like WHEN OBSERVED,")
+                print(f"         not at {horizon}. Do not read them as a {horizon} rate.")
         print(f"    {horizon:<4} observed={bucket['observed']:>7,} "
               f"backfilled={bucket['backfilled']:>7,} "
               f"due_unobserved={due[horizon]:>7,}   {split}")
@@ -276,6 +391,24 @@ async def cmd_inspect(cfg: Config, args: argparse.Namespace) -> int:
                 print("        LOWER BOUND on the true peak -- we sample, we do not stream.")
         else:
             print(f"{args.mint} not in tokens_seen")
+
+        path, events = await repo.load_path_and_events(db, args.mint)
+        if path:
+            print(f"\n-- price path ({len(path)} observations) --")
+            for r in path[:args.path_limit]:
+                print(f"  {r['observed_at']}  {r['status']:<16} "
+                      f"px={r.get('price_usd') or '-':<14} "
+                      f"liq={r.get('liquidity_usd') or '-':<12} age={r['age_seconds']}s")
+            if len(path) > args.path_limit:
+                print(f"  ... {len(path) - args.path_limit} more")
+        if events:
+            # Interleaved with the path on purpose: the question is whether the
+            # structural signal fired BEFORE the price move completed.
+            print(f"\n-- structural events ({len(events)}) --")
+            for e in events:
+                print(f"  {e['detected_at']}  {e['event_type']:<22} "
+                      f"{e['severity'] or '':<5} {e.get('before_value')} -> "
+                      f"{e.get('after_value')}")
 
         if args.enrich:
             from .enrich.goplus import GoPlusClient
@@ -400,6 +533,362 @@ async def cmd_verify_capture(cfg: Config, args: argparse.Namespace) -> int:
     return 1
 
 
+async def cmd_paper(cfg: Config, args: argparse.Namespace) -> int:
+    """Report the paper journal, or replay stored ticks through the simulator.
+
+    Reports what the journal says without softening it (part 0 rule 8). A paper
+    run that loses money is a result, not a bug -- 1.9 puts the expected value
+    of an unfiltered trade at -7.85% after costs, so a cascade that rejects
+    nothing SHOULD lose here, and seeing that is the point.
+    """
+    from decimal import Decimal
+
+    from .paper.fees import FeeModel, round_trip_cost_pct
+    from .paper.runner import PaperRunner
+    from .paper.simulator import ExitPlan, Tick
+
+    db = await pool_mod.connect(cfg.dsn)
+    try:
+        model = FeeModel()
+        if args.pessimistic:
+            model = model.pessimistic()
+
+        if args.replay:
+            plan = ExitPlan()
+            runner = PaperRunner(
+                db, bankroll_sol=Decimal(str(args.bankroll)),
+                size_pct=Decimal(str(args.size_pct)), plan=plan, model=model,
+            )
+            mints = [r["mint"] for r in await db.fetch(
+                "select distinct mint from trade_ticks limit ?", args.limit)]
+            if not mints:
+                print("no trade_ticks stored. Run `trenches stream` with paper enabled "
+                      "so positions subscribe to their own trade tape first.")
+                return 1
+            for mint in mints:
+                runner.arm(mint)
+                for row in await repo.ticks_for_mint(db, mint):
+                    price = row.get("price_sol")
+                    await runner.on_tick(mint, Tick(
+                        at=dt.datetime.fromisoformat(row["observed_at"]),
+                        price_sol=Decimal(price) if price else None,
+                        signature=row["signature"],
+                        is_buy=bool(row["is_buy"]) if row["is_buy"] is not None else None,
+                    ))
+                await runner.sweep_timeouts()
+            print(f"replayed {len(mints)} mint(s) through the simulator")
+
+        size_sol = Decimal(str(args.bankroll)) * Decimal(str(args.size_pct)) / Decimal(100)
+        explicit = round_trip_cost_pct(model, size_sol, include_slippage=False) * 100
+        total = round_trip_cost_pct(model, size_sol) * 100
+        print(f"\ncost model{' (PESSIMISTIC: 2x slippage)' if args.pessimistic else ''}")
+        print(f"  position size          {size_sol} SOL "
+              f"({args.size_pct}% of {args.bankroll})")
+        print(f"  explicit friction      {explicit:>6.2f}%   (1.6 budgets ~4%)")
+        print(f"  with slippage haircut  {total:>6.2f}%   (3.9.2: wider than quote)")
+        print("  the haircut is a chosen parameter, not a measurement")
+
+        s = await repo.paper_summary(db)
+        print(f"\npositions   {int(s.get('positions') or 0):>6}   "
+              f"closed {int(s.get('closed') or 0)}   open {int(s.get('still_open') or 0)}")
+        if int(s.get("closed") or 0) == 0:
+            print("  nothing closed yet -- no result to report")
+            return 0
+        print(f"  staked      {Decimal(s['total_staked_sol']):>12.6f} SOL")
+        print(f"  net PnL     {Decimal(s['net_pnl_sol']):>12.6f} SOL")
+        print(f"  fees        {Decimal(s['total_fees_sol']):>12.6f} SOL   "
+              "(logged separately from PnL, 1.10)")
+        if s.get("win_rate") is not None:
+            print(f"  win rate    {s['win_rate']:>12.1%}")
+        print(f"  exits       {s.get('exit_reasons')}")
+
+        print("\n3.9.6 promotion criteria")
+        closed = int(s.get("closed") or 0)
+        net = Decimal(s["net_pnl_sol"])
+        share = s.get("largest_win_share")
+        checks = [
+            (f"300+ logged decisions ({closed})", closed >= 300),
+            (f"net positive after fees ({net:.6f} SOL)", net > 0),
+            (
+                "no single trade > 20% of profit"
+                + (f" ({share:.0%})" if share is not None else " (n/a)"),
+                share is None or share <= 0.20,
+            ),
+        ]
+        for label, ok in checks:
+            print(f"  [{'x' if ok else ' '}] {label}")
+        print("  [ ] spans >= 3 weeks  -- and the clock only counts once the")
+        print("      cascade actually rejects things; a filter that accepts")
+        print("      everything is measuring the market, not the filter")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_structural(cfg: Config, args: argparse.Namespace) -> int:
+    """Fetch the structural half of Part 2 so stage 1 stops reading `unfetched`.
+
+    Free and keyless. Reports how many probes came back with any fields at all,
+    because GoPlus omitting a field is a different fact from the token being
+    clean, and stage 1 depends on that distinction.
+    """
+    from .enrich.structural import fetch_batch
+
+    db = await pool_mod.connect(cfg.dsn)
+    try:
+        before = await repo.structural_coverage(db)
+        report = await fetch_batch(db, limit=args.limit)
+        after = await repo.structural_coverage(db)
+        print(f"probed {report['probed']} mint(s), {report['errors']} error(s), "
+              f"{report['with_fields']} returned usable fields")
+        print(f"coverage    {after['probed']:,} / {after['tokens']:,} tokens "
+              f"(+{after['probed'] - before['probed']:,})")
+        print(f"with fields {after['with_fields']:,}")
+        print(f"would fail stage 1: {after['would_reject']:,}")
+        if after["probed"] and not after["with_fields"]:
+            print("\n** every probe came back with no usable fields. That is a vendor")
+            print("   or endpoint problem, NOT a clean market -- stage 1 will keep")
+            print("   reporting `unfetched`, which is the honest answer (Part 2).")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_exits(cfg: Config, args: argparse.Namespace) -> int:
+    """The exit loop, as its own process (3.1).
+
+    Reads open positions from the shared store, applies any ticks that arrived,
+    and closes whatever the plan says is over. Run this ALONGSIDE `trenches
+    stream`, not inside it: an entry-side crash or rate-limit stall leaving an
+    open bag unwatched is the most common way a homemade bot dies, and that only
+    stays true while both halves share a process.
+    """
+    from .paper import exits as exit_mod
+    from .paper.fees import FeeModel
+
+    db = await pool_mod.connect(cfg.dsn)
+    model = FeeModel().pessimistic() if args.pessimistic else FeeModel()
+    try:
+        while True:
+            report = await exit_mod.sweep(db, model=model)
+            if report["open"] or args.once:
+                print(f"open={report['open']} closed={report['closed']} "
+                      f"still_open={report['still_open']} unusable={report['unusable']}")
+            if args.once:
+                return 0
+            await asyncio.sleep(args.interval)
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        await db.close()
+
+
+async def cmd_sample(cfg: Config, args: argparse.Namespace) -> int:
+    """Run the dense price-path sampler. Its own process; ingest never notices."""
+    from .sample.cadence import DEFAULT_CADENCE, describe
+    from .sample.sampler import Sampler
+
+    db = await pool_mod.connect(cfg.dsn)
+    try:
+        sampler = Sampler(
+            db, cadence=DEFAULT_CADENCE,
+            max_age_seconds=int(args.max_age_hours * 3600),
+            control_share=args.control_share,
+            derive_outcomes=args.derive_outcomes,
+            derive_limit=args.derive_limit,
+        )
+        for line in describe(sampler.budget):
+            print(f"  {line}")
+        if args.compact:
+            from .sample.compaction import compact
+
+            report = await compact(
+                db, older_than_seconds=int(args.compact_after_hours * 3600))
+            print(f"\ncompacted {report.mints} path(s): "
+                  f"{report.rows_before:,} -> {report.rows_after:,} rows "
+                  f"({report.removed:,} removed)")
+            print("  extremes are always kept: a trailing stop is a function of peaks")
+            print("  and the falls from them, so dropping one would change a replay")
+            return 0
+        if args.derive_only:
+            from .sample.derive import derive_all
+
+            report = await derive_all(db, limit=args.derive_limit)
+            print(f"\n  derived {report.written} outcome row(s) across "
+                  f"{report.mints} mint(s) {report.by_horizon}")
+            print(f"  {report.skipped_no_observation} mint(s) had no observation near "
+                  "any checkpoint")
+            print("\n  Derived rows are marked backfilled with source=price_path and")
+            print("  carry their offset from the checkpoint, so a 30-second-off sample")
+            print("  and a two-hour-late poll stay distinguishable.")
+            return 0
+        if args.once:
+            admitted = await sampler.backfill_admissions()
+            observed = await sampler.tick()
+            print(f"\n  admitted   {admitted['admitted']} of "
+                  f"{admitted['considered']} candidate(s) {admitted['by_cohort']}")
+            print(f"  observed   {observed}")
+            counts = await repo.watch_set_counts(db)
+            if counts.get("control") and not counts.get("filtered"):
+                # Correct but non-obvious: without decisions the filtered arm
+                # cannot fill, and an empty filtered cohort reads as a bug.
+                print("\n  Only the control cohort is filling. That is expected until")
+                print("  `trenches decide` has run: the filtered arm admits mints the")
+                print("  cascade ACCEPTED, while the control arm is a uniform random")
+                print("  sample that ignores every filter by design.")
+            if not admitted["considered"] and not observed["due"]:
+                counts = await repo.watch_set_counts(db)
+                if not counts:
+                    print("\n  Nothing to do: the watch set is empty and tokens_seen has")
+                    print("  no mints recent enough to admit. The sampler PULLS from")
+                    print("  tokens_seen, so run `trenches stream` first, or widen")
+                    print("  --max-age-hours if the mints you have are older than that.")
+            return 0
+        await sampler.run(interval_seconds=args.interval)
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_replay_exits(cfg: Config, args: argparse.Namespace) -> int:
+    """Replay named rulesets over collected paths, split by cohort.
+
+    The comparison this whole change exists to produce. Fees and price impact
+    are applied; a rule that only wins before them has not won.
+    """
+    from decimal import Decimal
+
+    from .exits import report as report_mod
+    from .exits.cursor import Event, Observation
+    from .exits.engine import ExitEngine
+    from .exits.rules import library
+
+    rules = library()
+    wanted = args.rules.split(",") if args.rules else list(rules)
+    unknown = [r for r in wanted if r not in rules]
+    if unknown:
+        print(f"unknown ruleset(s): {unknown}. Available: {sorted(rules)}", file=sys.stderr)
+        return 2
+
+    db = await pool_mod.connect(cfg.dsn)
+    try:
+        mints = await repo.mints_with_paths(db, cohort=args.cohort, limit=args.limit)
+        if not mints:
+            print("no collected paths yet -- run `trenches sample` first")
+            return 1
+
+        engine = ExitEngine(
+            model=__import__("trenches.paper.fees", fromlist=["FeeModel"]).FeeModel()
+        )
+        loaded: dict[str, tuple[str, list, list]] = {}
+        for row in mints:
+            path_rows, event_rows = await repo.load_path_and_events(db, row["mint"])
+            observations = [Observation(
+                at=dt.datetime.fromisoformat(r["observed_at"]), status=r["status"],
+                price_usd=Decimal(r["price_usd"]) if r.get("price_usd") else None,
+                liquidity_usd=Decimal(r["liquidity_usd"]) if r.get("liquidity_usd") else None,
+                age_seconds=int(r["age_seconds"] or 0), venue_kind=r.get("venue_kind"),
+            ) for r in path_rows]
+            events = [Event(
+                at=dt.datetime.fromisoformat(e["detected_at"]),
+                event_type=e["event_type"], severity=e["severity"] or "warn",
+                delta_pct=e.get("delta_pct"),
+            ) for e in event_rows]
+            loaded[row["mint"]] = (row["cohort"], observations, events)
+
+        size = Decimal(str(args.size_usd))
+        rows: list = []
+        per_rule: dict[str, dict] = {}
+        for name in wanted:
+            replays_by_cohort: dict[str, list] = {}
+            per_rule[name] = {}
+            for mint, (cohort, obs, events) in loaded.items():
+                replay = engine.replay(mint=mint, cohort=cohort, rule=rules[name],
+                                       observations=obs, events=events, size_usd=size)
+                replays_by_cohort.setdefault(cohort, []).append(replay)
+                per_rule[name][mint] = replay
+            for cohort, replays in sorted(replays_by_cohort.items()):
+                rows.append(report_mod.summarise(replays, rule=name, cohort=cohort))
+
+        print(f"\nreplayed {len(loaded)} mint(s), position ${size} "
+              f"(size is compared against pool liquidity, so it must be USD)\n")
+        for line in report_mod.format_summary(rows):
+            print(line)
+
+        if "structural_first" in per_rule and "price_stop_only" in per_rule:
+            cmp_ = report_mod.compare_timing(
+                per_rule["structural_first"], per_rule["price_stop_only"])
+            print("\n  STRUCTURAL vs PRICE STOP -- did the structural signal fire first?")
+            print("    (only mints where BOTH fired; comparing across mints where only")
+            print("     one fired would compare different populations)")
+            print(f"    mints where both fired   {cmp_.mints_compared}")
+            if cmp_.mints_compared:
+                print(f"    structural first         {cmp_.structural_first} "
+                      f"({cmp_.structural_first_rate:.0%})")
+                print(f"    price stop first         {cmp_.price_first}")
+                print(f"    same observation         {cmp_.simultaneous}")
+                if cmp_.median_lead_seconds is not None:
+                    print(f"    median lead              {cmp_.median_lead_seconds:.0f}s")
+                print(f"    better outcome           {cmp_.better_fill_count}")
+                if cmp_.median_fill_gain is not None:
+                    print(f"    median gain              "
+                          f"{float(cmp_.median_fill_gain):+.3f}x")
+            else:
+                print("    nothing to compare yet -- needs paths where both rules fire")
+
+        print("\n  Impact assumes a balanced pool and uses liquidity from the LAST")
+        print("  observation, so mid-rug the real depth is lower than modelled.")
+        print("  These returns are therefore OPTIMISTIC, not conservative.")
+    finally:
+        await db.close()
+    return 0
+
+
+async def cmd_backup(cfg: Config, args: argparse.Namespace) -> int:
+    """Write a verified copy of the collected database.
+
+    The journal is the only artefact here that cannot be rebuilt: an
+    observation not taken today cannot be taken later. Safe to run while the
+    collectors are writing.
+    """
+    from pathlib import Path
+
+    from .db.backup import BackupError, backup_sqlite, prune_backups
+    from .db.dialect import POSTGRES, detect_dialect
+
+    if detect_dialect(cfg.dsn) == POSTGRES:
+        print("this command backs up SQLite only. For Postgres use pg_dump, which "
+              "your server already ships:", file=sys.stderr)
+        print("  pg_dump --format=custom --file=trenches-$(date +%%Y%%m%%d).dump <dsn>",
+              file=sys.stderr)
+        return 2
+
+    try:
+        report = backup_sqlite(cfg.dsn, Path(args.to) if args.to else None)
+    except BackupError as exc:
+        print(f"backup failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"wrote {report.path}  ({report.megabytes:,.1f} MB)")
+    for table, count in sorted(report.counts.items()):
+        print(f"  {table:<20}{count:>12,}")
+    if report.verified:
+        print("\n  row counts match the source and integrity_check passed")
+    else:
+        print(f"\n  ** ROW COUNTS DIFFER: {report.mismatches}", file=sys.stderr)
+        print("  Treat this copy as suspect.", file=sys.stderr)
+        return 1
+
+    if args.keep:
+        removed = prune_backups(report.path.parent, keep=args.keep,
+                                prefix=report.path.name.split("-")[0])
+        if removed:
+            print(f"  pruned {len(removed)} older backup(s), keeping {args.keep}")
+    return 0
+
+
 async def cmd_idl_check(cfg: Config, args: argparse.Namespace) -> int:
     from .decode import idl, idl_check
 
@@ -426,6 +915,254 @@ async def cmd_idl_check(cfg: Config, args: argparse.Namespace) -> int:
     for disc, (a, b) in sorted(collisions.items()):
         print(f"   {disc}  pump.{a} == pump_amm.{b}")
     return worst
+
+
+async def cmd_analyze(cfg: Config, args: argparse.Namespace) -> int:
+    """One coin in, four answers out: enter, size, take profit, stop.
+
+    Composes what already exists rather than adding a new opinion: the cascade
+    decides, the last price-path observation measures the pool, and 1.9 and 1.10
+    turn those into numbers for THIS coin. Everything it could not check is
+    printed, because a clean report over four unfetched stages looks identical
+    to a clean one over four checked stages unless the difference is on screen.
+    """
+    from decimal import Decimal
+
+    from . import advise
+    from .decide import (
+        UNSUPPLIED,
+        Cascade,
+        attach_first_buyers,
+        load_labels,
+        missing_from,
+    )
+
+    labels = load_labels(cfg.label_set_path or None)
+    db = await pool_mod.connect(cfg.dsn)
+    try:
+        token = await repo.get_token(db, args.mint)
+        if token is None:
+            print(f"{args.mint}: not in the journal.\n")
+            print("  Nothing has been collected for this mint, so there is nothing to")
+            print("  analyse. Run `trenches stream` to ingest launches, or pass a mint")
+            print("  this system has already seen.")
+            return 1
+
+        derived = await repo.load_funder_labels(db)
+        if derived["addresses"]:
+            labels = labels.with_shared_funders(derived["addresses"], derived["source"])
+
+        path = await repo.path_for_mint(db, args.mint)
+        events = await repo.events_for_mint(db, args.mint)
+        buyers = (await repo.first_buyers(db)).get(args.mint)
+
+        # Stage 3 and the pool measurement both want the newest observation that
+        # actually carried a liquidity figure -- not simply the newest row.
+        latest = next(
+            (r for r in reversed(path) if r.get("liquidity_usd") is not None), None
+        )
+        liquidity = advise.to_decimal(latest["liquidity_usd"]) if latest else None
+
+        facts = attach_first_buyers(dict(token), buyers)
+        facts.setdefault("mint", args.mint)
+        facts["excluded_addresses"] = [
+            a for a in (token.get("bonding_curve"),
+                        (latest or {}).get("pair_address")) if a
+        ]
+        if liquidity is not None:
+            facts["liquidity_usd"] = str(liquidity)
+            facts["liquidity_observed_at"] = latest["observed_at"]
+        if any(e["event_type"] == "rugged" for e in events):
+            facts["rugged"] = True
+
+        cascade = Cascade(
+            min_mints=cfg.decide_creator_min_mints,
+            max_rug_rate=cfg.decide_creator_max_rug_rate,
+            min_liquidity_usd=cfg.decide_min_liquidity_usd,
+            hold_horizon_seconds=cfg.decide_hold_horizon_seconds,
+            max_dev_pct=cfg.decide_max_dev_pct,
+            max_snipers=cfg.decide_max_snipers,
+            max_insiders=cfg.decide_max_insiders,
+            max_bundler_pct=cfg.decide_max_bundler_pct,
+            max_bundler_count=cfg.decide_max_bundler_count,
+            cold_start_seconds=cfg.decide_cold_start_seconds,
+            max_cluster_pct=cfg.decide_max_cluster_pct,
+            labels=labels,
+        )
+        verdict, trail = cascade.run(facts)
+        gaps = {k: UNSUPPLIED[k] for k in missing_from(facts)}
+    finally:
+        await db.close()
+
+    advice = advise.build(
+        mint=args.mint, verdict=verdict, trail=trail, liquidity_usd=liquidity,
+        bankroll=Decimal(str(args.bankroll)) if args.bankroll else None,
+        size_pct=Decimal(str(args.size_pct)),
+        unchecked=gaps,
+        observed={
+            "detected_at": token.get("detected_at"),
+            "launchpad": token.get("launchpad"),
+            "symbol": token.get("symbol"),
+            "path_points": len(path),
+            "structural_events": len(events),
+            "liquidity_observed_at": (latest or {}).get("observed_at"),
+            "first_buyers_seen": len(buyers or []),
+        },
+    )
+    _print_advice(advice)
+    return 0 if advice.verdict != advise.REJECT else 2
+
+
+def _print_advice(a) -> None:
+    money = lambda v: "unknown" if v is None else f"${v:,.2f}"   # noqa: E731
+
+    print(f"\n{'=' * 72}")
+    print(f"  {a.mint}")
+    if a.observed.get("symbol"):
+        print(f"  {a.observed['symbol']}  ({a.observed.get('launchpad') or 'unknown venue'})")
+    print(f"{'=' * 72}\n")
+
+    print(f"VERDICT   {a.verdict}")
+    print(f"          {a.verdict_reason}\n")
+
+    print("  stage  outcome    data")
+    for s in a.stages:
+        state = "accept" if s.accepted else "REJECT"
+        data = "read" if s.had_data else f"NONE ({s.note})"
+        print(f"    {s.stage}    {state:<9}  {data}")
+    print(f"\n  {a.checked_stages} of {len(a.stages)} stages had something to read.")
+
+    size = a.size
+    print(f"\n{'-' * 72}\nSIZE\n")
+    print(f"  recommended        {money(size.recommended)}")
+    print(f"  1.9 bankroll cap   {money(size.bankroll_cap)}   ({size.size_pct}% of bankroll)")
+    print(f"  pool cap           {money(size.depth_cap)}   "
+          f"(exit impact <= {size.target_exit_impact:.1%})")
+    print(f"  no-counterparty    {money(size.hard_depth_cap)}   "
+          f"(beyond this there is no fill at any price)")
+    print(f"  binding constraint {size.binding.upper()}")
+    print(f"\n  {size.note}.")
+
+    tp = a.take_profit
+    print(f"\n{'-' * 72}\nTAKE PROFIT\n")
+    print(f"  {tp.fraction:.0%} of the position at {tp.multiple}x"
+          "  (1.10: original stake off at 2x)")
+    print(f"  then a {tp.trail_pct:.0%} trailing stop on the remainder, rest rides free")
+    if tp.exit_value_at_tp is not None:
+        verdict_word = "yes" if tp.exitable else "NO -- partial fill only"
+        print(f"\n  selling {money(tp.exit_value_at_tp)} at target costs "
+              f"{tp.impact_at_tp:.2%} impact; exitable: {verdict_word}")
+    print(f"\n  {tp.note}.")
+
+    stop = a.stop
+    print(f"\n{'-' * 72}\nSTOP\n")
+    print("  STRUCTURAL FIRST -- these fire before the price move completes:")
+    for trigger in stop.structural:
+        print(f"    - {trigger}")
+    print(f"\n  price stop         -{stop.price_stop_pct:.0%} from peak")
+    if stop.realised_at_stop_pct is not None:
+        print(f"  actually realised  -{stop.realised_at_stop_pct:.1%} after impact "
+              f"at today's depth")
+    print(f"  time stop          {stop.time_stop_seconds // 60} min "
+          f"(1.2: median rugged lifespan ~14 min; 1.5: 85% of the profitable "
+          f"sniper cohort is out in 5)")
+    print(f"\n  {stop.note}.")
+
+    print(f"\n{'-' * 72}\nWHAT THIS DID NOT CHECK\n")
+    if a.unchecked:
+        for key, why in sorted(a.unchecked.items()):
+            print(f"  {key:<34} {why}")
+    else:
+        print("  nothing: every fact the cascade reads was supplied.")
+
+    print(f"\n  observed: {a.observed.get('path_points', 0)} price points, "
+          f"{a.observed.get('structural_events', 0)} structural events, "
+          f"{a.observed.get('first_buyers_seen', 0)} first buyers")
+    if a.observed.get("liquidity_observed_at"):
+        print(f"  liquidity read at {a.observed['liquidity_observed_at']}")
+
+    print(f"\n{'=' * 72}")
+    print("  THIS IS NOT A BUY SIGNAL. The cascade removes known disqualifiers;")
+    print("  it does not establish an edge. 1.9: a single trade on the realistic")
+    print("  distribution is about -5% gross and -7.85% after a 3% round trip,")
+    print("  and Kelly for a negative-edge game is f* ~ 0. The decision is yours.")
+    print(f"{'=' * 72}\n")
+
+
+async def cmd_funders(cfg: Config, args: argparse.Namespace) -> int:
+    """Derive shared-funder labels from our own funding graph. No vendor.
+
+    Two modes on purpose. `--report` prints the observed distribution of
+    `n_tokens` and does not write anything; writing requires `--cutoff`, which
+    has no default. Nobody has published a cutoff for this, so the operator
+    picks one from the shape of their own data and the number that produced each
+    label is stored on it.
+    """
+    from .decide import funders as fd
+
+    db = await pool_mod.connect(cfg.dsn)
+    try:
+        stats = await repo.funder_degrees(db, min_tokens=1)
+        if not stats:
+            print("no funding edges recorded yet\n")
+            print("  Nothing traces funders in this repo: the 2-hop trace needs RPC")
+            print("  (3.4: ~80-100 credits/token) and there is no RPC client here.")
+            print("  This command works the moment funding_edges has rows in it.")
+            return 0
+
+        dist = fd.distribution(stats)
+        gap = fd.widest_gap(stats)
+        print(f"{len(stats):,} funders over {sum(dist.values()):,} rows\n")
+        print("  n_tokens  funders")
+        for n_tokens, n in list(dist.items())[:25]:
+            print(f"  {n_tokens:>8,}  {n:>7,}")
+        if len(dist) > 25:
+            print(f"  ... {len(dist) - 25} more distinct counts")
+
+        if gap:
+            below, above = gap
+            print(f"\n  widest gap in the data: nothing between {below:,} and {above:,} tokens.")
+            print("  A cutoff anywhere in that range gives the same answer, so the")
+            print("  choice barely matters -- which is the good case.")
+        else:
+            print("\n  NO GAP: the counts are smooth, so there is no natural cutoff here")
+            print("  and any line you draw is arbitrary. Say so in the journal if you")
+            print("  draw one anyway.")
+
+        if args.cutoff is None:
+            print("\n  report only. Pass --cutoff N to derive and store labels.")
+            return 0
+
+        creators = await repo.known_creators(db)
+        derivation = fd.derive(stats, cutoff_tokens=args.cutoff, creators=creators)
+        # Second half of the guard: a deployer need not sign with the wallet
+        # that pays for things.
+        bankrollers = await repo.funders_of_creators(db)
+        for address in sorted(set(derivation.labels) & bankrollers):
+            derivation.withheld[address] = derivation.labels.pop(address)
+
+        source = f"derived(cutoff={args.cutoff})"
+        written = await repo.save_funder_labels(
+            db, labels=derivation.labels, cutoff_tokens=args.cutoff, source=source)
+    finally:
+        await db.close()
+
+    print(f"\n  labelled {written:,} shared funders at cutoff {args.cutoff:,} tokens")
+    if derivation.withheld:
+        print(f"\n  WITHHELD {len(derivation.withheld):,} that met the count but touch a")
+        print("  known creator. Each is a candidate SERIAL DEPLOYER, which is a finding")
+        print("  and not a skipped label -- 1.5: 85.3% of 178,109 studied were net")
+        print("  profitable against buyers. Stripping one would erase the most")
+        print("  extractive actor in the market from the clustering built to find it.")
+        for address, stat in sorted(
+            derivation.withheld.items(), key=lambda kv: -kv[1].n_tokens
+        )[:10]:
+            print(f"    {address[:20]:<20} {stat.n_tokens:>6,} tokens  "
+                  f"{stat.n_funded:>7,} wallets funded")
+    print("\n  These are NOT called `cex`. Nothing here establishes that any of them")
+    print("  is an exchange -- only that unioning through one would merge wallets")
+    print("  with nothing else in common, which is all stage 5 needs.")
+    return 0
 
 
 async def cmd_prune(cfg: Config, args: argparse.Namespace) -> int:
@@ -607,12 +1344,32 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
     different value in that column rather than a different branch.
     """
     import time
+    from dataclasses import replace
 
-    from .decide import Cascade
+    from .decide import (
+        UNSUPPLIED,
+        Cascade,
+        attach_first_buyers,
+        facts_from_row,
+        load_labels,
+        missing_from,
+    )
+
+    labels = load_labels(cfg.label_set_path or None)
 
     cascade = Cascade(
         min_mints=cfg.decide_creator_min_mints,
         max_rug_rate=cfg.decide_creator_max_rug_rate,
+        min_liquidity_usd=cfg.decide_min_liquidity_usd,
+        hold_horizon_seconds=cfg.decide_hold_horizon_seconds,
+        max_dev_pct=cfg.decide_max_dev_pct,
+        max_snipers=cfg.decide_max_snipers,
+        max_insiders=cfg.decide_max_insiders,
+        max_bundler_pct=cfg.decide_max_bundler_pct,
+        max_bundler_count=cfg.decide_max_bundler_count,
+        cold_start_seconds=cfg.decide_cold_start_seconds,
+        max_cluster_pct=cfg.decide_max_cluster_pct,
+        labels=labels,
     )
     thresholds = cascade.thresholds()
     version = code_version()
@@ -623,10 +1380,31 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
         if not rows:
             print("no undecided candidates")
             return 0
+        # One query for every candidate rather than one per candidate: stage 5's
+        # address set is free, but N round trips over 5,000 mints is not.
+        buyers = await repo.first_buyers(db)
+        # The derived set counts toward stage 5's usability exactly as a bought
+        # one does: what the stripping needs is a shared funder identified, not
+        # an exchange named.
+        derived = await repo.load_funder_labels(db)
+        if derived["addresses"]:
+            labels = labels.with_shared_funders(derived["addresses"], derived["source"])
+            cascade = replace(cascade, labels=labels)
         accepted = rejected = 0
+        #: An accept is not one thing. A candidate that passed a stage on real
+        #: data and one that passed it because nothing was fetched are opposite
+        #: facts, and a headline "accept" count that merges them is the number
+        #: that later gets mistaken for a filter working.
+        cold_start = unfetched = clustered = 0
+        gaps: dict[str, int] = {}
         for row in rows:
             started = time.perf_counter()
-            verdict, trail = cascade.run(dict(row))
+            facts = attach_first_buyers(
+                facts_from_row(row), buyers.get(row["mint"]),
+            )
+            for key in missing_from(facts):
+                gaps[key] = gaps.get(key, 0) + 1
+            verdict, trail = cascade.run(facts)
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             await repo.record_decision(db, mint=row["mint"], fields={
                 "stream_id": row.get("stream_id"),
@@ -644,6 +1422,11 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
                 rejected += 1
             else:
                 accepted += 1
+                by_stage = {v.stage: v.inputs for v in trail}
+                state = by_stage.get(4, {}).get("concentration")
+                cold_start += state == "cold_start"
+                unfetched += state == "unfetched"
+                clustered += by_stage.get(5, {}).get("clustering") is None
         summary = await repo.decision_summary(db)
     finally:
         await db.close()
@@ -655,10 +1438,29 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
         print("  rejections by stage:")
         for stage, n in sorted(summary["by_stage"].items()):
             print(f"    stage {stage}: {n:,}")
+    if accepted:
+        print(f"\n  of {accepted:,} accepts, stage 4 saw NOTHING for {unfetched:,} "
+              f"and cold-start zeros for {cold_start:,}")
+        print(f"  stage 5 actually clustered {clustered:,} of them")
+        print("  -- the rest are not clean bills of health, they are absences.")
+    if not labels.usable:
+        print(f"\n  STAGE 5 CANNOT REJECT: no CEX label set (source: {labels.source}).")
+        print("  Without one, every wallet funded from a single exchange hot wallet")
+        print("  unions into one cluster spanning most of the holder set, and the")
+        print("  stage would reject nearly every token while looking like it found")
+        print("  coordination. It computes and journals; it does not gate. Point")
+        print("  TRENCHES_LABEL_SET_PATH at a maintained set -- see labels.example.json.")
     if accepted == len(rows):
-        print("\n  NOTE every candidate was accepted. Stage 1 has no structural facts to")
-        print("  read (nothing fetches them yet) and stage 2 cannot fire because n_rugged")
-        print("  is zero everywhere -- nothing labels rugs. That is unlabelled, not clean.")
+        print("\n  NOTE every candidate was accepted. Run `structural` to give stage 1")
+        print("  something to read, `rugs` to fill n_rugged so stage 2 can fire, and")
+        print("  `sample` to collect the liquidity stage 3 reads. Until then this is")
+        print("  UNLABELLED, not clean.")
+    if gaps:
+        print("\n  facts no supplier in this repo provides yet:")
+        for key, n in sorted(gaps.items(), key=lambda kv: -kv[1]):
+            print(f"    {key:<36} {n:>7,} candidates   {UNSUPPLIED[key]}")
+        print("\n  Each is wired, thresholded and tested; none is guessed. A field path")
+        print("  nobody verified stays absent rather than becoming a plausible number.")
     return 0
 
 
@@ -766,6 +1568,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     stream = sub.add_parser("stream", help="run the ingest loop across all configured feeds")
     stream.add_argument("--record", metavar="DIR", help="also write events to JSONL for replay")
+    stream.add_argument("--paper", action=argparse.BooleanOptionalAction, default=True,
+                        help="run the cascade and open paper positions (default on). "
+                             "--no-paper is week-1 ingest only.")
+    stream.add_argument("--bankroll", default="10", help="speculative bankroll in SOL")
+    stream.add_argument("--size-pct", default="1.0", dest="size_pct",
+                        help="percent of bankroll per position (1.9 hard cap: 2.0)")
     stream.add_argument("--label", action="store_true",
                         help="also run the outcome labeler, isolated from ingest")
 
@@ -790,6 +1598,7 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--fresh", action="store_true",
                          help="request a cache bypass -- mandatory for held positions (3.4.6)")
     inspect.add_argument("--raw", action="store_true", help="dump raw payloads")
+    inspect.add_argument("--path-limit", type=int, default=40, dest="path_limit")
 
     verify = sub.add_parser("verify-capture",
                             help="check recorded PumpPortal frames against the declared schema")
@@ -807,7 +1616,76 @@ def build_parser() -> argparse.ArgumentParser:
     gate.add_argument("--days", type=float, default=7)
     gate.add_argument("-v", "--verbose", action="store_true", help="list every gap")
 
+    paper = sub.add_parser("paper", help="paper journal, cost model, and 3.9.6 progress")
+    paper.add_argument("--replay", action="store_true",
+                       help="replay stored trade_ticks through the simulator")
+    paper.add_argument("--bankroll", default="10", help="speculative bankroll in SOL")
+    paper.add_argument("--size-pct", default="1.0", dest="size_pct",
+                       help="percent of bankroll per position (1.9 hard cap: 2.0)")
+    paper.add_argument("--pessimistic", action="store_true",
+                       help="double the slippage haircut (3.9.6's pessimistic clause)")
+    paper.add_argument("--limit", type=int, default=5000)
+
+    structural = sub.add_parser(
+        "structural", help="fetch stage-1 structural facts (free, keyless)")
+    structural.add_argument("--limit", type=int, default=200)
+
+    exits = sub.add_parser(
+        "exits", help="run the exit loop as its own process (3.1) -- run alongside `stream`")
+    exits.add_argument("--interval", type=float, default=15.0)
+    exits.add_argument("--once", action="store_true")
+    exits.add_argument("--pessimistic", action="store_true")
+
+    sample = sub.add_parser("sample", help="dense price-path sampler (own process)")
+    sample.add_argument("--interval", type=float, default=5.0)
+    sample.add_argument("--once", action="store_true")
+    sample.add_argument("--max-age-hours", type=float, default=24.0,
+                        dest="max_age_hours",
+                        help="24h default: the 1-7d tail costs 41.6%% of the rate budget")
+    sample.add_argument("--control-share", type=float, default=0.5, dest="control_share")
+    sample.add_argument("--compact", action="store_true",
+                        help="downsample expired paths instead of sampling")
+    sample.add_argument("--compact-after-hours", type=float, default=24.0,
+                        dest="compact_after_hours")
+    sample.add_argument("--derive-only", action="store_true", dest="derive_only",
+                        help="project collected paths onto outcome horizons and exit")
+    sample.add_argument("--no-derive", action="store_false", dest="derive_outcomes",
+                        default=True,
+                        help="do not derive outcomes while sampling (leaves that to "
+                             "`trenches label`, which competes for the same budget)")
+    sample.add_argument("--derive-limit", type=int, default=1000, dest="derive_limit")
+
+    replay = sub.add_parser("replay-exits",
+                            help="replay exit rulesets over collected paths, by cohort")
+    replay.add_argument("--rules", default=None,
+                        help="comma-separated ruleset names (default: all)")
+    replay.add_argument("--cohort", default=None, choices=["filtered", "control"])
+    replay.add_argument("--size-usd", default="500", dest="size_usd",
+                        help="position size in USD; compared against pool liquidity")
+    replay.add_argument("--limit", type=int, default=5000)
+
+    backup = sub.add_parser(
+        "backup", help="verified copy of the collected database (safe while running)")
+    backup.add_argument("--to", default=None, help="destination path")
+    backup.add_argument("--keep", type=int, default=0,
+                        help="delete all but the newest N backups in that directory")
+
     sub.add_parser("idl-check", help="diff the vendored IDL against upstream")
+    analyze = sub.add_parser(
+        "analyze", help="one coin: enter, size, take profit, stop")
+    analyze.add_argument("mint")
+    analyze.add_argument("--bankroll", type=float, default=None,
+                         help="speculative bankroll, for 1.9's 1-2%% hard cap")
+    analyze.add_argument("--size-pct", type=float, default=1.0,
+                         help="percent of bankroll per position (1.9 hard cap: 2)")
+
+    funders = sub.add_parser(
+        "funders", help="derive shared-funder labels from the funding graph (no vendor)")
+    funders.add_argument(
+        "--cutoff", type=int, default=None,
+        help="label funders seen in at least this many DISTINCT mints. No default: "
+             "nobody has published one, so run without it first and read the "
+             "distribution.")
     sub.add_parser("prune", help="delete raw_events past the retention window")
     return parser
 
@@ -815,13 +1693,27 @@ def build_parser() -> argparse.ArgumentParser:
 HANDLERS = {
     "migrate": cmd_migrate, "stream": cmd_stream, "stats": cmd_stats,
     "inspect": cmd_inspect, "verify-capture": cmd_verify_capture,
-    "idl-check": cmd_idl_check, "prune": cmd_prune,
+    "paper": cmd_paper,
+    "structural": cmd_structural,
+    "exits": cmd_exits,
+    "sample": cmd_sample,
+    "backup": cmd_backup,
+    "replay-exits": cmd_replay_exits,
+    "idl-check": cmd_idl_check, "prune": cmd_prune, "funders": cmd_funders, "analyze": cmd_analyze,
     "label": cmd_label, "rules-report": cmd_rules_report, "gate": cmd_gate,
     "decide": cmd_decide, "rugs": cmd_rugs,
 }
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Line-buffer stdout. Python block-buffers when stdout is not a TTY, so a
+    # command that prints and then blocks in a loop -- `sample`, `stream`,
+    # `exits` -- produces NO output at all when redirected to a file or piped,
+    # which is indistinguishable from a hung process. This is the whole fix for
+    # "I didn't get any output".
+    with contextlib.suppress(AttributeError, ValueError):
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
     args = build_parser().parse_args(argv)
     try:
         cfg = Config.from_env()

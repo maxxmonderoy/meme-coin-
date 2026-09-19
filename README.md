@@ -17,20 +17,151 @@ evidence which could ever justify paying for a faster feed later.
 
 ## Quick start
 
-```bash
-uv venv .venv
-uv pip install --python .venv/bin/python --require-hashes --only-binary :all: -r requirements.txt
-uv pip install --python .venv/bin/python -e . --no-deps   # provides the `trenches` command
+Comments are deliberately kept OUT of this block: zsh does not treat `#` as a
+comment in an interactive shell unless `interactive_comments` is set, so a
+pasted block with inline comments fails on every one of them.
 
-cp .env.example trenches.local.conf        # NOT `.env` — see §3.10.6
+Everything below assumes you are INSIDE the repository directory. `.venv` lives
+there, not in your home directory.
+
+```zsh
+git clone https://github.com/maxxmonderoy/meme-coin-.git
+cd meme-coin-
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e . --no-deps
+cp .env.example trenches.local.conf
 export TRENCHES_ENV_FILE=trenches.local.conf
-
 trenches migrate
-trenches stream --record captures/
-trenches stats --hours 24
-trenches verify-capture captures/
-trenches inspect <mint> --enrich
 ```
+
+`uv` is faster if you have it — `uv venv .venv` and `uv pip install --python
+.venv/bin/python ...` — but it is not required, and the hash-pinned install
+(§3.10.10) is `pip install --require-hashes -r requirements.txt` either way.
+
+Without activating the venv, prefix every command with `.venv/bin/` instead:
+`.venv/bin/trenches migrate`. The console script is installed there and is not
+on your PATH otherwise.
+
+### Windows
+
+**Python 3.11 or 3.12 — not 3.13.** `pyproject.toml` pins
+`requires-python = ">=3.11,<3.13"`, and python.org's download button gives you
+the newest release, which is past that. Check with `py --version`, and if it is
+too new install 3.12 alongside it and build the venv with `py -3.12`.
+
+```powershell
+git clone https://github.com/maxxmonderoy/meme-coin-.git
+cd meme-coin-
+py -3.12 -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\pip install -e . --no-deps
+copy .env.example trenches.local.conf
+.venv\Scripts\trenches migrate
+```
+
+Then start the collectors:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\collectors.ps1 start
+powershell -ExecutionPolicy Bypass -File .\scripts\collectors.ps1 status
+powershell -ExecutionPolicy Bypass -File .\scripts\collectors.ps1 stop
+```
+
+**`-ExecutionPolicy Bypass` is not optional.** Windows blocks unsigned `.ps1`
+files by default and the error it gives does not say so clearly.
+
+**Sleep stops collection**, and it is the failure that silently costs a whole
+week — you come back to six hours of data. In Settings → System → Power &
+battery, set *When plugged in, put my device to sleep* to **Never**, and on a
+laptop set *When I close the lid* to **Do nothing**. Being plugged in is not
+enough on its own.
+
+Logs land in `logs\<name>.log` and `logs\<name>.err.log` — split because
+`Start-Process` refuses to send both streams to one file. `status` reads the
+error log first, since that is where a crash lands.
+
+No dependency here is platform-specific, but `requirements.txt` is compiled on
+Linux and that is not the same thing. `pytest` declares
+`colorama>=0.4 ; sys_platform == "win32"`, which the Linux compile never emits,
+so on Windows pip found an unpinned transitive dependency and refused the
+**entire** install under `--require-hashes`. `colorama` is now pinned by hand
+with a `win32` marker and a comment saying a recompile on Linux will drop it
+again. If `--require-hashes` rejects something else, that is the same class of
+bug — report it rather than working around it.
+
+### Collecting (macOS / Linux)
+
+One command starts all three and leaves them running after you close the
+terminal:
+
+```zsh
+./scripts/collectors.sh start
+./scripts/collectors.sh status
+./scripts/collectors.sh logs
+./scripts/collectors.sh stop
+```
+
+It calls `.venv/bin/trenches` directly, so it works whether or not the venv is
+activated — `command not found: trenches` is what happens when it is not, and
+that is not worth hitting twice. Logs go to `logs/<name>.log` and survive the
+terminal closing. `logs` follows all three at once; ctrl-C stops watching, not
+collecting.
+
+**On a Mac, closing the lid still sleeps the machine and the collectors stop
+with it.** To leave it running for days, keep it plugged in and run
+`caffeinate -dimsu` in a terminal you can leave open. The script says so on
+startup.
+
+They are three processes because §3.1 says so: an entry-side stall must never
+stop an exit loop. They share only the database.
+
+To run one by hand instead:
+
+```zsh
+.venv/bin/trenches stream --record captures/
+.venv/bin/trenches exits
+.venv/bin/trenches sample
+.venv/bin/trenches structural --limit 200
+```
+
+### Looking at what you collected
+
+```bash
+trenches stats --hours 24            # feeds, watch set, budget utilisation, cohorts
+trenches inspect <mint>              # price path and event timeline together
+trenches decide                      # run the cascade, journal every verdict
+trenches paper                       # the paper journal and §3.9.6 progress
+trenches replay-exits                # compare exit rulesets, split by cohort
+trenches sample --compact            # downsample expired paths
+trenches backup --keep 7             # verified copy; the journal cannot be rebuilt
+trenches verify-capture captures/    # confirm the PumpPortal frame schema
+```
+
+**Back up the database.** Everything else here is code and code is reversible.
+The journal is a record of tokens that launched at a particular moment, and
+nobody else stores what happened to them -- an observation not taken today
+cannot be taken later, so losing the file costs calendar time rather than
+developer time. `trenches backup` is safe to run while the collectors are
+writing (it uses `VACUUM INTO`, not a file copy, which is the classic way to get
+a backup that restores to a corrupt database), and it verifies row counts and
+runs an integrity check on the copy.
+
+**Running `label` and `sample` together splits one 60 req/min budget.** They
+hold guaranteed shares rather than contending -- 65% to `sample`, 35% to
+`label` -- because a single shared bucket prevents a ban but not starvation: at
+a high batch limit the labeler alone takes 48 of 60 req/min. The two collect
+different things and the choice is real: `label` covers 100% of launches with
+four data points each, `sample` covers ~18% with a point every 30 seconds. A
+trailing stop cannot be backtested on four points, so the exit work needs
+`sample`.
+
+Start with `trenches sample --once` rather than `trenches sample`: it prints what
+it admitted and what it observed, and tells you what is missing if the answer is
+nothing. Two things that look broken and are not — only the `control` cohort
+fills until `trenches decide` has run, and `not_yet_indexed` dominates early
+because DexScreener has not indexed a brand new mint yet.
 
 No database server to install. SQLite is the default; Postgres is a
 connection-string change and both are covered by the same tests.
@@ -159,7 +290,46 @@ watchdog can catch it, a live feed sends a clean EOF, four failures fire in a
 row to test bounded backoff, and events are replayed to prove dedupe. A soak
 says "nothing went wrong"; this says "we made it go wrong and nothing was lost".
 
-## Week 2: the cascade, stages 0-2 (paper only)
+## One coin in, four answers out
+
+```bash
+trenches analyze <mint> --bankroll 2000
+```
+
+Enter, size, take profit, stop — for one coin, composed from what the cascade,
+the pool observation and the event timeline already know. It refuses three
+things, and the refusals are the design:
+
+**1. It never says "enter."** The cascade removes disqualifiers; it does not find
+edge. §1.9 is explicit that a single trade on the realistic distribution is about
+−5% gross and −7.85% after a 3% round trip, and Kelly for a negative-edge game is
+f\* ≈ 0. So the verdict is `REJECT`, `NO DISQUALIFIER`, or `INSUFFICIENT DATA` —
+and today the third is the honest answer for almost everything, because most
+stages have nothing to read.
+
+**2. It never hides what it could not check.** A clean report over four unfetched
+stages looks identical to a clean one over four checked stages unless the
+difference is printed, and Part 2 names reading empty as clean the most expensive
+mistake available. Every run ends with the gap list and a `2 of 6 stages had
+something to read` line.
+
+**3. The stop is structural first, price second.** A price stop assumes a bid.
+On a token with $6,000 of liquidity mid-rug there is no bid — the stop fills far
+below where it triggered, or not at all. The triggers that fire *before* the
+price move completes (liquidity collapse, `rugged` flipping true, the pool
+disappearing) are the half a price-only stop-loss cannot give you.
+
+**The pool often caps the position, not the bankroll.** §1.9 says 1–2% of
+speculative bankroll and says nothing about whether the position can be *sold*.
+Sizing runs both caps and names the binding one — on a $6,200 pool, a $500k
+bankroll is capped at **$63**, not $5,000, because that is the largest position
+whose exit costs under 2% impact. "I sized small" and "I could not have got out
+of anything bigger" are different facts.
+
+Exit codes: `0` no disqualifier or insufficient data, `2` rejected, `1` unknown
+mint.
+
+## The cascade, stages 0-5 (paper only)
 
 ```bash
 trenches decide --limit 5000     # journal a verdict for every candidate
@@ -188,6 +358,209 @@ report rather than hide.** Two reasons, both stated in the command's own output:
 
 A cascade that accepts everything is not a filter. It is a filter with no data,
 and the difference is worth keeping visible.
+
+### Stage 3: liquidity, LP lock state, unlock horizon
+
+Four rejections, in the order they cost money: already flagged `rugged`;
+liquidity below the floor; LP neither burned nor locked; and 3.4's free check
+that almost nobody does -- **the lock expiring inside the holding horizon**. A
+lock that ends while you hold is not a lock, it is a countdown, and the deployer
+chose when it ends.
+
+```bash
+TRENCHES_DECIDE_MIN_LIQUIDITY_USD=5000        # UNCALIBRATED, see below
+TRENCHES_DECIDE_HOLD_HORIZON_SECONDS=21600
+```
+
+**The floor is an assumption, not a finding, and every journal row says so.**
+3.4 gives no liquidity number, and 1.2's $1,000 figure is Solidus's measure of a
+token being effectively *dead*, not a floor for entry. `thresholds()` therefore
+records `calibrated: false` alongside the number, so a later tuning pass against
+matched controls cannot quietly rewrite what earlier rows meant.
+
+**Stage 3 spends no request.** Liquidity comes from the most recent `price_path`
+observation the sampler already collected, and `rugged` from the structural
+event timeline. Both have verified sources in this repo -- DexScreener's
+`liquidity.usd` and RugCheck's top-level `rugged`.
+
+**Half of stage 3 has no supplier, and that is stated rather than faked.** LP
+lock state and the locker's `unlockDate` are real fields 3.4 names, but nothing
+here has confirmed which field of a RugCheck report carries them, so they
+journal as `unknown` -- never as a pass. Part 0 rule 2: a plausible-sounding
+field path is worse than a gap.
+
+The distinction the code works hardest to keep is between **unknown** and
+**clean**. A candidate nobody fetched records `{"liquidity": "unfetched"}`; a
+candidate with liquidity but no lock data records the liquidity and marks the
+rest `unknown`. Those are different facts, and a journal that cannot tell them
+apart is the one that later justifies a loss.
+
+### Stage 4: concentration, coordination, and the cold start
+
+Five rejections, and every number is quoted from 3.4 rather than chosen here:
+`dev.percentage > 5`, `snipers.total > 20`, `insiders.total > 20`,
+`bundlers.total > 15`, `bundlers.count >= 100`. The comparators are copied
+exactly — bundler *count* is `>=` while the rest are strictly `>` — because the
+boundary is where a filter gets argued about. All reasons are collected rather
+than short-circuited: they come from one payload, so reading all of them is
+free, and a row saying "snipers AND insiders AND bundlers" is worth more later
+than one saying "snipers".
+
+**The cold start is enforced here, not noted.** This is the part of stage 4 that
+matters most. Every one of those rules is *reject if greater than N*, and Part 2
+says every behavioural field starts empty. So an unguarded stage 4 does not
+merely fail to reject a thirty-second-old mint — it **actively passes it**, on a
+payload of structural zeros, and the journal would record a clean sweep. Below
+`TRENCHES_DECIDE_COLD_START_SECONDS` the values are recorded as `cold_start` and
+**no rule may fire on them in either direction**: a number too early to believe
+cannot condemn a token any more than it can clear one. The default is 600s — the
+conservative end of Part 2's 2–10 minute populate window.
+
+`decide` therefore reports its accepts split three ways, because an accept on
+real data and an accept on an absence are opposite facts:
+
+```
+decided 3  accept=1  reject=2
+  of 1 accepts, stage 4 saw NOTHING for 1 and cold-start zeros for 0
+  -- those are not clean bills of health, they are absences.
+```
+
+**Top-10 share excludes the curve**, per 3.4: "compute top-10 excluding pool,
+bonding-curve and locker addresses or you'll reject on the curve itself." On a
+live pump.fun curve the curve holds essentially the whole supply, so a naive
+top-10 reads ~100% for every token that exists and carries no information. The
+curve address comes from the launch and the pool address from the price path;
+**locker addresses have no source here**, so the exclusion list actually applied
+is journalled rather than assumed complete.
+
+**Two quantities are computed and journalled but do not gate by default**,
+because 3.4 gives no number for either:
+
+- **Top-10 share.** 1.5 gives a *delta* — "first 10 buyers hold 17 percentage
+  points more supply than low-risk" — never a level, and a delta cannot be
+  applied to a single token.
+- **The bundler distribution delta**, `totalInitialPercentage - totalPercentage`.
+  3.4: "high initial + low current means they already distributed into you. That
+  delta is more informative than either level and is free in the payload."
+  Informative — with no threshold attached.
+
+Both have opt-in knobs (`max_top10_pct`, `max_bundler_distribution_pct`) that
+default to off. Journalling them now is what makes calibrating them possible;
+gating on a number nobody measured would be a guess wearing a filter's clothes.
+
+**Stage 4 has no supplier and says so.** Nothing in this repo collects dev share,
+sniper, insider or bundler counts, or a holder list, so today stage 4 journals
+`unfetched` for every candidate and `decide` prints the gap list:
+
+```
+  facts no supplier in this repo provides yet:
+    holders            2,153 candidates   no normalised holder list is stored
+    snipers_total      2,153 candidates   behavioural, cold start; nothing collects it
+    ...
+```
+
+That list lives in `decide/facts.py` as data, not as a comment nobody reads —
+the difference between a known gap and a silent one.
+
+### Stage 5: funding-chain clustering
+
+The only stage that can see what 1.5 measures: **36.5% of supply that appears
+independently held is controlled by coordinated accounts.** Twenty wallets at 2%
+each looks like distribution and is one wallet if nineteen were funded by the
+twentieth. No per-address rule can see that — only the graph. Per 3.4: top-20
+holders ∪ first buyers → strip CEX/DEX/pool/locker → 2-hop funder trace →
+union-find → **reject if the largest non-CEX cluster exceeds 15% of supply.**
+
+**A single address is not a cluster.** One wallet holding 30% is a large holder,
+and stage 4 already asks about those. Counting it here would relabel
+concentration as coordination — the same number, presented as evidence of
+something it is not — so the gate runs on clusters of two or more and the
+largest lone holder is journalled beside it. Both numbers appear in every row,
+which is what shows stage 5 declined to answer stage 4's question.
+
+**Without a CEX label set, stage 5 cannot reject, and this is the single most
+important thing in it.** Two strangers who both withdrew from the same exchange
+share a funder and nothing else. Skip the stripping and every wallet funded from
+one hot wallet unions into a single cluster, that cluster spans most of the
+holder set, and the stage rejects nearly every token *while looking like it
+found coordination in all of them*. **A confident wrong answer is worse than a
+gap**, so an empty CEX set suppresses the rejection and says so in the row and in
+the command's output. There is a test that demonstrates the inversion rather than
+asserting it: six unrelated wallets become one 60% cluster unlabelled, and six
+lone 10% holders labelled.
+
+```bash
+TRENCHES_LABEL_SET_PATH=/path/to/labels.json
+TRENCHES_DECIDE_MAX_CLUSTER_PCT=15
+```
+
+**`labels.example.json` ships with zero addresses in it, deliberately.** An
+exchange hot-wallet address recalled from memory is exactly the invented constant
+Part 0 rule 2 forbids: it looks right, it cannot be checked by reading it, and
+exchanges rotate them. A stale CEX address does not fail loudly — it silently
+stops stripping and the stage's answer inverts. Export a maintained set and
+refresh it on a schedule; `decide/labels.py` carries the sources verified
+8 Sep 2026 and the caveat on each — including that Dune's free tier goes
+view-only on 10 Sep 2026 for accounts created before 21 Jul 2026.
+
+### Deriving the label set instead of buying one
+
+```bash
+trenches funders                 # report the distribution, write nothing
+trenches funders --cutoff 100    # derive and store labels
+```
+
+The stripping does not need "this address is Binance". It needs "this funder's
+presence is not evidence of coordination", and that is a property of the graph:
+infrastructure funds wallets across many **unrelated** tokens, while a dev's
+funding wallet funds wallets inside its own launches. Derived this way the set
+never goes stale, costs nothing, and catches bridges and distributors a CEX list
+omits. A derived set arms stage 5 exactly as a bought one does, and the two
+compose — the bought list is authoritative on names, the derived one on currency.
+
+**The statistic is `n_tokens`, not out-degree, and that is the whole design.** A
+deployer funding forty sniper wallets inside one launch has an out-degree of
+forty and is *exactly* the actor stage 5 exists to catch. Counting distinct mints
+separates it from infrastructure; counting edges merges them.
+
+**The failure this mostly defends against.** §1.5: of 178,109 serial deployers
+studied, 85.3% were net profitable against buyers, and the most aggressive ran
+~353 tokens/day. Such a wallet appears across hundreds of mints and **looks
+identical to infrastructure** by any count test — stripping it would erase the
+most extractive actor in the market from the clustering built to find it. So an
+address is never labelled if it is a known creator *or funds one*, checked
+against `tokens_seen.signer` and `creators`, which we already have. On a
+synthetic 300-launch graph the guard withheld both the serial deployer (200
+mints, 1,000 sniper wallets) and the treasury bankrolling it, while labelling the
+exchange and the bridge.
+
+**There is no default cutoff, and the command will not invent one.** Run it bare
+and it prints the observed distribution plus the sharpest break in the data —
+ranked by *ratio*, not absolute width, because these counts span orders of
+magnitude and a 100→200 step would otherwise outrank the 1→100 boundary that
+actually matters. If the counts are smooth it says so: no natural cutoff exists
+and any line drawn is arbitrary. `derive` refuses a cutoff below 2 outright,
+since a funder seen in exactly one token is the single-launch case by definition.
+
+**They are not called `cex`.** Nothing here establishes that any of them is an
+exchange — only that unioning through one would merge wallets with nothing else
+in common, which is all stage 5 needs.
+
+**What is supplied and what is not.** First buyers are free and real —
+`trade_ticks.trader` comes from PumpPortal's `traderPublicKey`, the field that
+actually exists where third-party write-ups claimed `creator`. That is half of
+3.4's address set. The other half (top-20 holders), the per-address supply
+shares, and the funder edges are not: the 2-hop trace needs RPC (3.4: ~80–100
+credits/token) and there is no RPC client in this repo. So today stage 5 records
+`no_edges` and gates on nothing.
+
+**One thing it deliberately does not do: build co-buy edges from arrival times.**
+Part 2 endorses same-*slot* co-buy clustering as the only bundle evidence at t=0
+— but PumpPortal carries no block time, so all this repo has is when a message
+reached our socket. Clustering on that would manufacture coordination out of
+network jitter, which is exactly the failure 3.4 warns about when it says to use
+matched controls or you will fit launch quality and call it coordination. Real
+slots need the gRPC lane in 3.2.
 
 ## Derived rug labels
 
