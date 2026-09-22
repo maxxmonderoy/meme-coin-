@@ -933,6 +933,7 @@ async def cmd_analyze(cfg: Config, args: argparse.Namespace) -> int:
         UNSUPPLIED,
         Cascade,
         attach_first_buyers,
+        attach_funding_edges,
         load_labels,
         missing_from,
     )
@@ -955,6 +956,7 @@ async def cmd_analyze(cfg: Config, args: argparse.Namespace) -> int:
         path = await repo.path_for_mint(db, args.mint)
         events = await repo.events_for_mint(db, args.mint)
         buyers = (await repo.first_buyers(db)).get(args.mint)
+        edges = (await repo.funding_edges_for(db, [args.mint])).get(args.mint)
 
         # Stage 3 and the pool measurement both want the newest observation that
         # actually carried a liquidity figure -- not simply the newest row.
@@ -963,7 +965,7 @@ async def cmd_analyze(cfg: Config, args: argparse.Namespace) -> int:
         )
         liquidity = advise.to_decimal(latest["liquidity_usd"]) if latest else None
 
-        facts = attach_first_buyers(dict(token), buyers)
+        facts = attach_funding_edges(attach_first_buyers(dict(token), buyers), edges)
         facts.setdefault("mint", args.mint)
         facts["excluded_addresses"] = [
             a for a in (token.get("bonding_curve"),
@@ -1007,6 +1009,7 @@ async def cmd_analyze(cfg: Config, args: argparse.Namespace) -> int:
             "structural_events": len(events),
             "liquidity_observed_at": (latest or {}).get("observed_at"),
             "first_buyers_seen": len(buyers or []),
+            "funding_edges": len(edges or []),
         },
     )
     _print_advice(advice)
@@ -1077,7 +1080,8 @@ def _print_advice(a) -> None:
 
     print(f"\n  observed: {a.observed.get('path_points', 0)} price points, "
           f"{a.observed.get('structural_events', 0)} structural events, "
-          f"{a.observed.get('first_buyers_seen', 0)} first buyers")
+          f"{a.observed.get('first_buyers_seen', 0)} first buyers, "
+          f"{a.observed.get('funding_edges', 0)} funding edges")
     if a.observed.get("liquidity_observed_at"):
         print(f"  liquidity read at {a.observed['liquidity_observed_at']}")
 
@@ -1350,6 +1354,7 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
         UNSUPPLIED,
         Cascade,
         attach_first_buyers,
+        attach_funding_edges,
         facts_from_row,
         load_labels,
         missing_from,
@@ -1383,6 +1388,7 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
         # One query for every candidate rather than one per candidate: stage 5's
         # address set is free, but N round trips over 5,000 mints is not.
         buyers = await repo.first_buyers(db)
+        edges = await repo.funding_edges_for(db, [r["mint"] for r in rows])
         # The derived set counts toward stage 5's usability exactly as a bought
         # one does: what the stripping needs is a shared funder identified, not
         # an exchange named.
@@ -1399,8 +1405,9 @@ async def cmd_decide(cfg: Config, args: argparse.Namespace) -> int:
         gaps: dict[str, int] = {}
         for row in rows:
             started = time.perf_counter()
-            facts = attach_first_buyers(
-                facts_from_row(row), buyers.get(row["mint"]),
+            facts = attach_funding_edges(
+                attach_first_buyers(facts_from_row(row), buyers.get(row["mint"])),
+                edges.get(row["mint"]),
             )
             for key in missing_from(facts):
                 gaps[key] = gaps.get(key, 0) + 1

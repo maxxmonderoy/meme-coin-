@@ -24,7 +24,13 @@ from .cascade import (
     top10_share,
 )
 from .cluster import CO_BUY, FUNDING, Clustering, UnionFind, cluster
-from .facts import UNSUPPLIED, attach_first_buyers, facts_from_row, missing_from
+from .facts import (
+    UNSUPPLIED,
+    attach_first_buyers,
+    attach_funding_edges,
+    facts_from_row,
+    missing_from,
+)
 from .labels import EMPTY, LabelSet, load_labels
 
 __all__ = [
@@ -38,6 +44,7 @@ __all__ = [
     "UnionFind",
     "Verdict",
     "attach_first_buyers",
+    "attach_funding_edges",
     "cluster",
     "facts_from_row",
     "load_labels",

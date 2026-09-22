@@ -896,6 +896,35 @@ async def record_funding_edges(
     return stored
 
 
+async def funding_edges_for(db: Database, mints: list[str]) -> dict[str, list[tuple]]:
+    """Stored funding edges, grouped by mint, for stage 5's union-find.
+
+    THE READ SIDE OF funding_edges, which did not exist until an audit looked
+    for it. `record_funding_edges` wrote rows, `funder_degrees` aggregated them
+    and `trenches funders` derived labels from them -- but nothing put them back
+    into the facts the cascade reads, so stage 5 would have reported `no_edges`
+    forever on a fully populated graph. A table with a writer and no reader
+    fails silently in exactly the direction that looks like "no coordination
+    found".
+
+    Returns (funder, funded, relation) triples. One query for the whole
+    candidate set: funding_edges is sparse compared with the candidate list, so
+    fetching everything and grouping in Python beats N round trips.
+    """
+    if not mints:
+        return {}
+    wanted = set(mints)
+    out: dict[str, list[tuple]] = {}
+    for row in await db.fetch(
+        "select mint, funder, funded, relation from funding_edges"
+    ):
+        if row["mint"] in wanted:
+            out.setdefault(row["mint"], []).append(
+                (row["funder"], row["funded"], row["relation"])
+            )
+    return out
+
+
 async def funder_degrees(db: Database, *, min_tokens: int = 1) -> list[dict]:
     """Per funder: distinct mints it appeared in, and distinct wallets it funded.
 

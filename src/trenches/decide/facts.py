@@ -33,10 +33,24 @@ UNSUPPLIED: dict[str, str] = {
         "for this mint; the top-20 holders half has no source"
     ),
     "cluster_edges": (
-        "stage 5: the 2-hop funder trace needs RPC and there is no RPC client here"
+        "stage 5: funding_edges is empty -- the 2-hop trace needs RPC and there "
+        "is no RPC client here. The read path exists; nothing fills the table."
     ),
     "holdings": "stage 5: no per-address supply share is stored",
 }
+
+
+def attach_funding_edges(facts: dict, edges: list | None) -> dict:
+    """Add stage 5's edge set from stored funding_edges. Mutates and returns.
+
+    Kept beside attach_first_buyers rather than inside facts_from_row because
+    both need a query facts_from_row does not get to make, and because a
+    supplier that is easy to forget is one that gets forgotten -- this pair is
+    the whole reason stage 5 can see anything at all.
+    """
+    if edges:
+        facts["cluster_edges"] = list(edges)
+    return facts
 
 
 def attach_first_buyers(facts: dict, buyers: list[str] | None) -> dict:
